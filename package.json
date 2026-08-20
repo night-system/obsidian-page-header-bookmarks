@@ -1,11 +1,12 @@
 {
   "name": "obsidian-page-header-bookmarks",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Bookmark icon in the page header; opens a popover with your core Bookmarks",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "node --test --test-isolation=none tests/tree.test.cjs"
   },
   "keywords": [
     "obsidian",

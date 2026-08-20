@@ -1,40 +1,18 @@
-import { ItemView, Plugin, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import { ItemView, Plugin, WorkspaceLeaf } from "obsidian";
+import { buildTree, isFileLike, isFolderLike } from "./tree";
+import type {
+	BookmarkGroupLike as BookmarkGroup,
+	BookmarkItemLike as BookmarkItem,
+	BookmarksDataLike as BookmarksData,
+	TreeNode,
+	VaultLike,
+} from "./tree";
 
 /* ------------------------------------------------------------------ */
-/* Core-plugin "Bookmarks" data model (internal, based on decompiled    */
-/* types from obsidian-typings for Obsidian 1.13.x).                    */
+/* Bookmark data model + tree building / dedup live in src/tree.ts      */
+/* (pure logic, no obsidian import); this file only wires the vault in  */
+/* and renders the resulting tree.                                      */
 /* ------------------------------------------------------------------ */
-
-interface BookmarkItem {
-	type?: "file" | "folder" | "group" | "search" | "url" | "graph";
-	title?: string;
-	path?: string;
-	subpath?: string;
-	/** Search bookmarks store their query here. */
-	query?: string;
-	/** URL bookmarks store the URL here. */
-	url?: string;
-	/** Graph bookmarks store the saved graph view options here. */
-	options?: unknown;
-	/** Group bookmarks nest their children here. */
-	items?: BookmarkItem[];
-}
-
-interface BookmarkGroup {
-	id?: string;
-	title?: string;
-	items?: BookmarkItem[];
-}
-
-interface BookmarksData {
-	items: BookmarkItem[];
-	groups: BookmarkGroup[];
-}
-
-/** Strip leading/trailing slashes so bookmark paths resolve reliably. */
-function normalizePath(p: string): string {
-	return p.replace(/^\/+|\/+$/g, "");
-}
 
 /* ------------------------------------------------------------------ */
 /* Icons (Lucide-style inline SVGs)                                    */
@@ -47,25 +25,6 @@ const ICON_LINK = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24
 const ICON_GRAPH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>`;
 const ICON_CHEVRON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`;
 const ICON_CLOSE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`;
-
-/* ------------------------------------------------------------------ */
-/* Tree model                                                          */
-/* ------------------------------------------------------------------ */
-
-type NodeKind = "group" | "folder" | "file" | "search" | "url" | "graph";
-
-interface TreeNode {
-	kind: NodeKind;
-	title: string;
-	path?: string;
-	subpath?: string;
-	query?: string;
-	url?: string;
-	options?: unknown;
-	id?: string;
-	/** Lazily loaded / prebuilt children (groups and folders). */
-	children?: TreeNode[];
-}
 
 export default class PageHeaderBookmarksPlugin extends Plugin {
 	/** Injected page-header buttons, keyed by the view they belong to. */
@@ -220,10 +179,10 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	/**
 	 * Fetch bookmark data from every source we know about, newest first:
 	 *   1. live instances (`app.bookmarks`, `app.internalPlugins…instance`)
-	 *      — items may be ungrouped (old shape) or a unified list that also
-	 *      contains `type: "group"` entries with nested items (new shape);
-	 *   2. `getBookmarks()` flat list when the instance exposes it;
-	 *   3. the core plugin's data file `.obsidian/bookmarks.json` (most
+	 *      — the `items` tree is authoritative (it preserves group nesting),
+	 *      so prefer it over the `getBookmarks()` flat list, which may
+	 *      float group-nested items up to the top level;
+	 *   2. the core plugin's data file `.obsidian/bookmarks.json` (most
 	 *      reliable across versions; read on demand so it is always fresh).
 	 */
 	private async resolveBookmarks(): Promise<BookmarksData | null> {
@@ -253,8 +212,6 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 					items?: BookmarkItem[];
 					groups?: BookmarkGroup[];
 				};
-				// Prefer the canonical `items` tree over the flattened
-				// getBookmarks() list (which may duplicate group children).
 				const items = Array.isArray(s.items) ? s.items : [];
 				const groups = Array.isArray(s.groups) ? s.groups : [];
 				if (items.length > 0 || groups.length > 0) return { items, groups };
@@ -297,10 +254,6 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		list.empty();
 
 		const data = await this.resolveBookmarks();
-		console.debug(
-			"Page Header Bookmarks: bookmark data resolved",
-			data ? { items: data.items.length, groups: data.groups.length } : null
-		);
 		if (!data) {
 			list.createDiv({
 				cls: "phb-empty",
@@ -320,7 +273,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			return;
 		}
 
-		const nodes = this.buildTree(data);
+		const nodes = buildTree(data, this.app.vault as unknown as VaultLike);
 		if (nodes.length === 0) {
 			list.createDiv({
 				cls: "phb-empty",
@@ -330,119 +283,6 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		}
 
 		this.renderNodes(list, nodes);
-	}
-
-	private buildTree(data: BookmarksData): TreeNode[] {
-		// Items whose target no longer exists are hidden (same as the core
-		// bookmarks view), and file/folder bookmarks inside a bookmarked
-		// folder are only shown via that folder's expansion (dedup).
-		const covered = this.computeCoveredPaths(data);
-
-		const convert = (it: BookmarkItem | undefined): TreeNode | null => {
-			if (!it) return null;
-			if (it.type === "group") {
-				// Nested groups are supported by the core bookmarks UI.
-				const kids = (Array.isArray(it.items) ? it.items : [])
-					.map(convert)
-					.filter((n): n is TreeNode => n !== null);
-				return { kind: "group", title: it.title || "未命名分组", children: kids };
-			}
-			if (
-				(it.type === "file" || it.type === "folder") &&
-				it.path &&
-				covered.has(normalizePath(it.path))
-			) {
-				return null;
-			}
-			return this.itemToNode(it);
-		};
-
-		const root: TreeNode[] = [];
-		for (const it of data.items) {
-			const n = convert(it);
-			if (n) root.push(n);
-		}
-		for (const g of data.groups) {
-			const kids = (g?.items ?? [])
-				.map(convert)
-				.filter((n): n is TreeNode => n !== null);
-			root.push({ kind: "group", id: g?.id, title: g?.title || "未命名分组", children: kids });
-		}
-
-		// Real data can duplicate a target both inside a group and as a
-		// standalone item; the standalone copy is only visible after removing
-		// the one that is already reachable by expanding the group.
-		this.dropRootDuplicatesOfGroupItems(root);
-		console.debug("Page Header Bookmarks: tree built", {
-			items: data.items.length,
-			groups: data.groups.length,
-			coveredByFolders: covered.size,
-			nodes: root.length,
-		});
-		return root;
-	}
-
-	/**
-	 * Paths that should not appear as standalone bookmarks: every file and
-	 * folder inside any bookmarked folder (they are reachable by expanding
-	 * the folder bookmark instead).
-	 */
-	private computeCoveredPaths(data: BookmarksData): Set<string> {
-		const folderPaths = new Set<string>();
-		const collect = (it: BookmarkItem | undefined): void => {
-			if (!it) return;
-			if (it.type === "folder" && it.path) folderPaths.add(normalizePath(it.path));
-			(it.items ?? []).forEach(collect);
-		};
-		data.items.forEach(collect);
-		for (const g of data.groups) (g?.items ?? []).forEach(collect);
-
-		const covered = new Set<string>();
-		const visit = (path: string): void => {
-			const folder = this.app.vault.getAbstractFileByPath(path);
-			if (!(folder instanceof TFolder)) return;
-			for (const child of folder.children) {
-				if (child instanceof TFile) {
-					covered.add(child.path);
-				} else if (child instanceof TFolder) {
-					covered.add(child.path);
-					visit(child.path);
-				}
-			}
-		};
-		for (const p of folderPaths) visit(p);
-		return covered;
-	}
-
-	private itemToNode(it: BookmarkItem | undefined): TreeNode | null {
-		if (!it) return null;
-		const type = it.type;
-		if (type === "file") {
-			const path = normalizePath(it.path ?? "");
-			const file = this.app.vault.getAbstractFileByPath(path);
-			// Deleted files are hidden, same as the core bookmarks view.
-			if (!(file instanceof TFile)) return null;
-			const title = it.title && it.title.trim() ? it.title : file.basename;
-			return { kind: "file", title, path, subpath: it.subpath };
-		}
-		if (type === "folder") {
-			const path = normalizePath(it.path ?? "");
-			const folder = this.app.vault.getAbstractFileByPath(path);
-			if (!(folder instanceof TFolder)) return null;
-			const title = it.title && it.title.trim() ? it.title : folder.name;
-			return { kind: "folder", title, path };
-		}
-		if (type === "search") {
-			const query = it.query ?? it.path ?? "";
-			return { kind: "search", title: it.title || query || "搜索", query, path: it.path ?? "" };
-		}
-		if (type === "url") {
-			return { kind: "url", title: it.title || it.url || "链接", url: it.url ?? "" };
-		}
-		if (type === "graph") {
-			return { kind: "graph", title: it.title || "图谱", options: it.options };
-		}
-		return null;
 	}
 
 	/** Stable identity for a tree node, used to keep expansion state across re-renders. */
@@ -462,55 +302,6 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 				return `group:${node.id ?? node.title}`;
 			default:
 				return "";
-		}
-	}
-
-	/** Exact bookmark target key (type + target fields) for duplicate detection. */
-	private targetKey(n: TreeNode): string {
-		switch (n.kind) {
-			case "file":
-				return `file:${n.path ?? ""}#${n.subpath ?? ""}`;
-			case "folder":
-				return `folder:${n.path ?? ""}`;
-			case "search":
-				return `search:${n.query ?? n.path ?? ""}`;
-			case "url":
-				return `url:${n.url ?? ""}`;
-			case "graph":
-				return `graph:${n.title ?? ""}`;
-			default:
-				return "";
-		}
-	}
-
-	/**
-	 * Real bookmark data can contain the same target both inside a group and
-	 * as a standalone top-level item (e.g. a folder that is represented by a
-	 * group bookmark). The standalone copy is a duplicate of something already
-	 * visible when the group is expanded, so drop it. Matching is by exact
-	 * target key only — never by basename or path prefix — to avoid hiding
-	 * legitimately separate bookmarks (e.g. same-named files elsewhere).
-	 */
-	private dropRootDuplicatesOfGroupItems(root: TreeNode[]): void {
-		const inGroups = new Set<string>();
-		const collectChildren = (nodes: TreeNode[]): void => {
-			for (const n of nodes) {
-				if (n.kind === "group") collectChildren(n.children ?? []);
-				else inGroups.add(this.targetKey(n));
-			}
-		};
-		const collectGroups = (nodes: TreeNode[]): void => {
-			for (const n of nodes) {
-				if (n.kind === "group") {
-					collectChildren(n.children ?? []);
-					collectGroups(n.children ?? []);
-				}
-			}
-		};
-		collectGroups(root);
-		for (let i = root.length - 1; i >= 0; i--) {
-			const n = root[i];
-			if (n.kind !== "group" && inGroups.has(this.targetKey(n))) root.splice(i, 1);
 		}
 	}
 
@@ -584,11 +375,11 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			if (!node.children) {
 				const folder = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
 				const kids: TreeNode[] = [];
-				if (folder instanceof TFolder) {
+				if (isFolderLike(folder)) {
 					for (const child of folder.children) {
-						if (child instanceof TFile) {
+						if (isFileLike(child)) {
 							kids.push({ kind: "file", title: child.basename, path: child.path });
-						} else if (child instanceof TFolder) {
+						} else if (isFolderLike(child)) {
 							kids.push({ kind: "folder", title: child.name, path: child.path });
 						}
 					}
@@ -629,7 +420,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 
 	private openFile(node: TreeNode): void {
 		const file = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
-		if (!(file instanceof TFile)) {
+		if (!isFileLike(file)) {
 			// Deleted between render and click — still close per the close rule.
 			this.closePopover();
 			return;

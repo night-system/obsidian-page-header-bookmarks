@@ -28,9 +28,162 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-function normalizePath(p) {
-  return p.replace(/^\/+|\/+$/g, "");
+
+// src/tree.ts
+function normalizePathForCompare(path) {
+  let p = String(path != null ? path : "").trim();
+  p = p.replace(/\\/g, "/");
+  p = p.replace(/\/{2,}/g, "/");
+  p = p.replace(/\/\.(?=\/|$)/g, "");
+  p = p.replace(/^\.\//, "");
+  p = p.replace(/^\/+|\/+$/g, "");
+  return p.normalize("NFC");
 }
+function isFileLike(x) {
+  return !!x && typeof x === "object" && typeof x.basename === "string" && typeof x.extension === "string";
+}
+function isFolderLike(x) {
+  return !!x && typeof x === "object" && Array.isArray(x.children) && typeof x.path === "string";
+}
+function collectFolderBookmarks(data) {
+  var _a, _b, _c;
+  const out = [];
+  const collect = (it) => {
+    var _a2;
+    if (!it) return;
+    if (it.type === "folder" && it.path) out.push(it);
+    ((_a2 = it.items) != null ? _a2 : []).forEach(collect);
+  };
+  ((_a = data == null ? void 0 : data.items) != null ? _a : []).forEach(collect);
+  for (const g of (_b = data == null ? void 0 : data.groups) != null ? _b : []) ((_c = g == null ? void 0 : g.items) != null ? _c : []).forEach(collect);
+  return out;
+}
+function computeCovered(data, vault) {
+  const covered = { paths: /* @__PURE__ */ new Set(), objects: /* @__PURE__ */ new Set() };
+  const visit = (path) => {
+    const folder = vault.getAbstractFileByPath(path);
+    if (!isFolderLike(folder)) return;
+    for (const child of folder.children) {
+      if (isFileLike(child) || isFolderLike(child)) {
+        covered.objects.add(child);
+        covered.paths.add(normalizePathForCompare(child.path));
+      }
+      if (isFolderLike(child)) visit(child.path);
+    }
+  };
+  for (const f of collectFolderBookmarks(data)) if (f.path) visit(f.path);
+  return covered;
+}
+function isCovered(covered, item, vault) {
+  if (item.type !== "file" && item.type !== "folder") return false;
+  if (!item.path) return false;
+  const obj = vault.getAbstractFileByPath(item.path);
+  if (obj && covered.objects.has(obj)) return true;
+  return covered.paths.has(normalizePathForCompare(item.path));
+}
+function itemToNode(it, vault) {
+  var _a, _b, _c, _d, _e, _f;
+  if (!it) return null;
+  const type = it.type;
+  if (type === "file") {
+    const path = (_a = it.path) != null ? _a : "";
+    const file = vault.getAbstractFileByPath(path);
+    if (!isFileLike(file)) return null;
+    const title = it.title && it.title.trim() ? it.title : file.basename;
+    return { kind: "file", title, path, subpath: it.subpath };
+  }
+  if (type === "folder") {
+    const path = (_b = it.path) != null ? _b : "";
+    const folder = vault.getAbstractFileByPath(path);
+    if (!isFolderLike(folder)) return null;
+    const title = it.title && it.title.trim() ? it.title : folder.name;
+    return { kind: "folder", title, path };
+  }
+  if (type === "search") {
+    const query = (_d = (_c = it.query) != null ? _c : it.path) != null ? _d : "";
+    return { kind: "search", title: it.title || query || "\u641C\u7D22", query, path: (_e = it.path) != null ? _e : "" };
+  }
+  if (type === "url") {
+    return { kind: "url", title: it.title || it.url || "\u94FE\u63A5", url: (_f = it.url) != null ? _f : "" };
+  }
+  if (type === "graph") {
+    return { kind: "graph", title: it.title || "\u56FE\u8C31", options: it.options };
+  }
+  return null;
+}
+function buildTree(data, vault) {
+  var _a, _b, _c;
+  const covered = computeCovered(data, vault);
+  const convert = (it) => {
+    if (!it) return null;
+    if (isCovered(covered, it, vault)) return null;
+    if (it.type === "group") {
+      const kids = (Array.isArray(it.items) ? it.items : []).map(convert).filter((n) => n !== null);
+      return { kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids };
+    }
+    return itemToNode(it, vault);
+  };
+  const root = [];
+  for (const it of (_a = data == null ? void 0 : data.items) != null ? _a : []) {
+    const n = convert(it);
+    if (n) root.push(n);
+  }
+  for (const g of (_b = data == null ? void 0 : data.groups) != null ? _b : []) {
+    const kids = ((_c = g == null ? void 0 : g.items) != null ? _c : []).map(convert).filter((n) => n !== null);
+    root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
+  }
+  return dedupeTree(root, vault);
+}
+function collectFolderExpansion(node, vault) {
+  const out = { paths: /* @__PURE__ */ new Set(), objects: /* @__PURE__ */ new Set() };
+  const visit = (path) => {
+    const folder = vault.getAbstractFileByPath(path);
+    if (!isFolderLike(folder)) return;
+    for (const child of folder.children) {
+      if (isFileLike(child) || isFolderLike(child)) {
+        out.objects.add(child);
+        out.paths.add(normalizePathForCompare(child.path));
+      }
+      if (isFolderLike(child)) visit(child.path);
+    }
+  };
+  if (node.path) visit(node.path);
+  return out;
+}
+function dedupeTree(root, vault) {
+  const covered = { paths: /* @__PURE__ */ new Set(), objects: /* @__PURE__ */ new Set() };
+  const visitFolder = (nodes) => {
+    for (const n of nodes) {
+      if (n.kind === "folder") {
+        const exp = collectFolderExpansion(n, vault);
+        exp.objects.forEach((o) => covered.objects.add(o));
+        exp.paths.forEach((p) => covered.paths.add(p));
+      }
+      if (n.children) visitFolder(n.children);
+    }
+  };
+  visitFolder(root);
+  const doomed = [];
+  const scan = (nodes) => {
+    for (const n of nodes) {
+      if ((n.kind === "file" || n.kind === "folder") && n.path) {
+        const obj = vault.getAbstractFileByPath(n.path);
+        if (obj && covered.objects.has(obj) || covered.paths.has(normalizePathForCompare(n.path))) {
+          doomed.push(n);
+        }
+      }
+      if (n.children) scan(n.children);
+    }
+  };
+  scan(root);
+  const drop = new Set(doomed);
+  const prune = (nodes) => nodes.filter((n) => !drop.has(n)).map(
+    (n) => n.children ? { ...n, children: prune(n.children) } : n
+  );
+  return prune(root);
+}
+
+// src/main.ts
 var ICON_FOLDER = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`;
 var ICON_FILE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>`;
 var ICON_SEARCH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>`;
@@ -170,10 +323,10 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   /**
    * Fetch bookmark data from every source we know about, newest first:
    *   1. live instances (`app.bookmarks`, `app.internalPlugins…instance`)
-   *      — items may be ungrouped (old shape) or a unified list that also
-   *      contains `type: "group"` entries with nested items (new shape);
-   *   2. `getBookmarks()` flat list when the instance exposes it;
-   *   3. the core plugin's data file `.obsidian/bookmarks.json` (most
+   *      — the `items` tree is authoritative (it preserves group nesting),
+   *      so prefer it over the `getBookmarks()` flat list, which may
+   *      float group-nested items up to the top level;
+   *   2. the core plugin's data file `.obsidian/bookmarks.json` (most
    *      reliable across versions; read on demand so it is always fresh).
    */
   async resolveBookmarks() {
@@ -225,10 +378,6 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   async renderInto(list) {
     list.empty();
     const data = await this.resolveBookmarks();
-    console.debug(
-      "Page Header Bookmarks: bookmark data resolved",
-      data ? { items: data.items.length, groups: data.groups.length } : null
-    );
     if (!data) {
       list.createDiv({
         cls: "phb-empty",
@@ -244,7 +393,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       });
       return;
     }
-    const nodes = this.buildTree(data);
+    const nodes = buildTree(data, this.app.vault);
     if (nodes.length === 0) {
       list.createDiv({
         cls: "phb-empty",
@@ -253,100 +402,6 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       return;
     }
     this.renderNodes(list, nodes);
-  }
-  buildTree(data) {
-    var _a;
-    const covered = this.computeCoveredPaths(data);
-    const convert = (it) => {
-      if (!it) return null;
-      if (it.type === "group") {
-        const kids = (Array.isArray(it.items) ? it.items : []).map(convert).filter((n) => n !== null);
-        return { kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids };
-      }
-      if ((it.type === "file" || it.type === "folder") && it.path && covered.has(normalizePath(it.path))) {
-        return null;
-      }
-      return this.itemToNode(it);
-    };
-    const root = [];
-    for (const it of data.items) {
-      const n = convert(it);
-      if (n) root.push(n);
-    }
-    for (const g of data.groups) {
-      const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map(convert).filter((n) => n !== null);
-      root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
-    }
-    this.dropRootDuplicatesOfGroupItems(root);
-    console.debug("Page Header Bookmarks: tree built", {
-      items: data.items.length,
-      groups: data.groups.length,
-      coveredByFolders: covered.size,
-      nodes: root.length
-    });
-    return root;
-  }
-  /**
-   * Paths that should not appear as standalone bookmarks: every file and
-   * folder inside any bookmarked folder (they are reachable by expanding
-   * the folder bookmark instead).
-   */
-  computeCoveredPaths(data) {
-    var _a;
-    const folderPaths = /* @__PURE__ */ new Set();
-    const collect = (it) => {
-      var _a2;
-      if (!it) return;
-      if (it.type === "folder" && it.path) folderPaths.add(normalizePath(it.path));
-      ((_a2 = it.items) != null ? _a2 : []).forEach(collect);
-    };
-    data.items.forEach(collect);
-    for (const g of data.groups) ((_a = g == null ? void 0 : g.items) != null ? _a : []).forEach(collect);
-    const covered = /* @__PURE__ */ new Set();
-    const visit = (path) => {
-      const folder = this.app.vault.getAbstractFileByPath(path);
-      if (!(folder instanceof import_obsidian.TFolder)) return;
-      for (const child of folder.children) {
-        if (child instanceof import_obsidian.TFile) {
-          covered.add(child.path);
-        } else if (child instanceof import_obsidian.TFolder) {
-          covered.add(child.path);
-          visit(child.path);
-        }
-      }
-    };
-    for (const p of folderPaths) visit(p);
-    return covered;
-  }
-  itemToNode(it) {
-    var _a, _b, _c, _d, _e, _f;
-    if (!it) return null;
-    const type = it.type;
-    if (type === "file") {
-      const path = normalizePath((_a = it.path) != null ? _a : "");
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (!(file instanceof import_obsidian.TFile)) return null;
-      const title = it.title && it.title.trim() ? it.title : file.basename;
-      return { kind: "file", title, path, subpath: it.subpath };
-    }
-    if (type === "folder") {
-      const path = normalizePath((_b = it.path) != null ? _b : "");
-      const folder = this.app.vault.getAbstractFileByPath(path);
-      if (!(folder instanceof import_obsidian.TFolder)) return null;
-      const title = it.title && it.title.trim() ? it.title : folder.name;
-      return { kind: "folder", title, path };
-    }
-    if (type === "search") {
-      const query = (_d = (_c = it.query) != null ? _c : it.path) != null ? _d : "";
-      return { kind: "search", title: it.title || query || "\u641C\u7D22", query, path: (_e = it.path) != null ? _e : "" };
-    }
-    if (type === "url") {
-      return { kind: "url", title: it.title || it.url || "\u94FE\u63A5", url: (_f = it.url) != null ? _f : "" };
-    }
-    if (type === "graph") {
-      return { kind: "graph", title: it.title || "\u56FE\u8C31", options: it.options };
-    }
-    return null;
   }
   /** Stable identity for a tree node, used to keep expansion state across re-renders. */
   nodeKey(node) {
@@ -366,56 +421,6 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
         return `group:${(_i = node.id) != null ? _i : node.title}`;
       default:
         return "";
-    }
-  }
-  /** Exact bookmark target key (type + target fields) for duplicate detection. */
-  targetKey(n) {
-    var _a, _b, _c, _d, _e, _f, _g;
-    switch (n.kind) {
-      case "file":
-        return `file:${(_a = n.path) != null ? _a : ""}#${(_b = n.subpath) != null ? _b : ""}`;
-      case "folder":
-        return `folder:${(_c = n.path) != null ? _c : ""}`;
-      case "search":
-        return `search:${(_e = (_d = n.query) != null ? _d : n.path) != null ? _e : ""}`;
-      case "url":
-        return `url:${(_f = n.url) != null ? _f : ""}`;
-      case "graph":
-        return `graph:${(_g = n.title) != null ? _g : ""}`;
-      default:
-        return "";
-    }
-  }
-  /**
-   * Real bookmark data can contain the same target both inside a group and
-   * as a standalone top-level item (e.g. a folder that is represented by a
-   * group bookmark). The standalone copy is a duplicate of something already
-   * visible when the group is expanded, so drop it. Matching is by exact
-   * target key only — never by basename or path prefix — to avoid hiding
-   * legitimately separate bookmarks (e.g. same-named files elsewhere).
-   */
-  dropRootDuplicatesOfGroupItems(root) {
-    const inGroups = /* @__PURE__ */ new Set();
-    const collectChildren = (nodes) => {
-      var _a;
-      for (const n of nodes) {
-        if (n.kind === "group") collectChildren((_a = n.children) != null ? _a : []);
-        else inGroups.add(this.targetKey(n));
-      }
-    };
-    const collectGroups = (nodes) => {
-      var _a, _b;
-      for (const n of nodes) {
-        if (n.kind === "group") {
-          collectChildren((_a = n.children) != null ? _a : []);
-          collectGroups((_b = n.children) != null ? _b : []);
-        }
-      }
-    };
-    collectGroups(root);
-    for (let i = root.length - 1; i >= 0; i--) {
-      const n = root[i];
-      if (n.kind !== "group" && inGroups.has(this.targetKey(n))) root.splice(i, 1);
     }
   }
   renderNodes(container, nodes) {
@@ -486,11 +491,11 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       if (!node.children) {
         const folder = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
         const kids = [];
-        if (folder instanceof import_obsidian.TFolder) {
+        if (isFolderLike(folder)) {
           for (const child of folder.children) {
-            if (child instanceof import_obsidian.TFile) {
+            if (isFileLike(child)) {
               kids.push({ kind: "file", title: child.basename, path: child.path });
-            } else if (child instanceof import_obsidian.TFolder) {
+            } else if (isFolderLike(child)) {
               kids.push({ kind: "folder", title: child.name, path: child.path });
             }
           }
@@ -528,7 +533,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   openFile(node) {
     var _a;
     const file = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
-    if (!(file instanceof import_obsidian.TFile)) {
+    if (!isFileLike(file)) {
       this.closePopover();
       return;
     }

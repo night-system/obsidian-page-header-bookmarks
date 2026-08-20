@@ -1,4 +1,5 @@
-import esbuild from "esbuild";
+import { execFileSync } from "child_process";
+import { createRequire } from "module";
 import process from "process";
 import builtins from "builtin-modules";
 
@@ -10,11 +11,17 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = process.argv[2] === "production";
 
-const context = await esbuild.context({
-  banner: { js: banner },
-  entryPoints: ["src/main.ts"],
-  bundle: true,
-  external: [
+// Run the esbuild binary directly (stdio inherited) instead of the JS API:
+// the JS API spawns its native service process with piped stdio, which some
+// sandboxed environments block with EPERM. Options and output are identical
+// to the previous `esbuild.context()` setup.
+const require = createRequire(import.meta.url);
+const esbuildBin = require.resolve("esbuild/bin/esbuild");
+
+const args = [
+  "src/main.ts",
+  "--bundle",
+  ...[
     "obsidian",
     "electron",
     "@codemirror/autocomplete",
@@ -29,18 +36,14 @@ const context = await esbuild.context({
     "@lezer/highlight",
     "@lezer/lr",
     ...builtins,
-  ],
-  format: "cjs",
-  target: "es2018",
-  logLevel: "info",
-  sourcemap: prod ? false : "inline",
-  treeShaking: true,
-  outfile: "main.js",
-});
+  ].map((m) => `--external:${m}`),
+  "--format=cjs",
+  "--target=es2018",
+  "--log-level=info",
+  "--tree-shaking=true",
+  `--banner:js=${banner}`,
+  "--outfile=main.js",
+];
+if (!prod) args.push("--sourcemap=inline", "--watch");
 
-if (prod) {
-  await context.rebuild();
-  process.exit(0);
-} else {
-  await context.watch();
-}
+execFileSync(process.execPath, [esbuildBin, ...args], { stdio: "inherit" });
