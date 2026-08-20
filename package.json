@@ -1,0 +1,25 @@
+{
+  "name": "obsidian-page-header-bookmarks",
+  "version": "1.0.0",
+  "description": "Bookmark icon in the page header; opens a popover with your core Bookmarks",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "bookmarks"
+  ],
+  "author": "night-system",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "latest",
+    "tslib": "^2.6.0",
+    "typescript": "^5.4.0"
+  }
+}

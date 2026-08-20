@@ -1,0 +1,176 @@
+/* Page Header Bookmarks */
+
+/* --- page header button (in each pane's .view-header) --- */
+
+.phb-button {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
+	margin: 0 2px;
+	border-radius: var(--radius-s, 4px);
+	color: var(--icon-color);
+	cursor: pointer;
+}
+
+.phb-button:hover {
+	background-color: var(--background-modifier-hover);
+	color: var(--icon-color-hover);
+}
+
+.phb-button svg {
+	width: 16px;
+	height: 16px;
+}
+
+/* --- backdrop: any click outside the popover closes it --- */
+
+.phb-backdrop {
+	position: fixed;
+	inset: 0;
+	z-index: 10000;
+	background: transparent;
+}
+
+/* --- popover --- */
+
+.phb-popover {
+	position: fixed;
+	z-index: 10001;
+	display: flex;
+	flex-direction: column;
+	min-width: 220px;
+	max-width: min(320px, calc(100vw - 16px));
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m, 8px);
+	box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+	overflow: hidden;
+	font-size: var(--font-ui-small);
+}
+
+.phb-popover-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 6px 6px 6px 12px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.phb-popover-title {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.phb-close {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
+	border-radius: var(--radius-s, 4px);
+	color: var(--icon-color);
+	cursor: pointer;
+}
+
+.phb-close:hover {
+	background-color: var(--background-modifier-hover);
+	color: var(--icon-color-hover);
+}
+
+.phb-close svg {
+	width: 14px;
+	height: 14px;
+}
+
+.phb-popover-list {
+	overflow-y: auto;
+	max-height: min(60vh, 480px);
+	padding: 4px;
+}
+
+/* --- items --- */
+
+.phb-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 8px;
+	border-radius: var(--radius-s, 4px);
+	cursor: pointer;
+	color: var(--text-normal);
+	white-space: nowrap;
+}
+
+.phb-item:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.phb-item-icon {
+	flex: none;
+	display: flex;
+	color: var(--text-muted);
+}
+
+.phb-item-icon svg {
+	width: 14px;
+	height: 14px;
+}
+
+.phb-caret {
+	flex: none;
+	display: flex;
+	color: var(--text-faint);
+	transition: transform 0.15s ease;
+}
+
+.phb-caret svg {
+	width: 12px;
+	height: 12px;
+}
+
+.phb-caret.phb-open {
+	transform: rotate(90deg);
+}
+
+.phb-item-title {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.phb-item-missing {
+	opacity: 0.5;
+}
+
+.phb-children {
+	margin-left: 10px;
+	padding-left: 6px;
+	border-left: 1px solid var(--background-modifier-border);
+}
+
+/* --- empty / enable states --- */
+
+.phb-empty {
+	padding: 16px 12px;
+	color: var(--text-muted);
+	text-align: center;
+	line-height: 1.5;
+}
+
+.phb-enable {
+	display: block;
+	margin: 8px auto 12px;
+	padding: 4px 12px;
+	border-radius: var(--radius-s, 4px);
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+	font-size: var(--font-ui-small);
+	cursor: pointer;
+}
+
+.phb-enable:hover {
+	opacity: 0.9;
+}
