@@ -251,9 +251,9 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     var _a;
     const root = [];
     for (const it of data.items) {
-      if ((it == null ? void 0 : it.type) === "group" && Array.isArray(it.items) && it.items.length > 0) {
-        const kids = it.items.map((x) => this.itemToNode(x)).filter((n) => n !== null);
-        if (kids.length > 0) root.push({ kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
+      if ((it == null ? void 0 : it.type) === "group") {
+        const kids = (Array.isArray(it.items) ? it.items : []).map((x) => this.itemToNode(x)).filter((n) => n !== null);
+        root.push({ kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
       } else {
         const n = this.itemToNode(it);
         if (n) root.push(n);
@@ -261,7 +261,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     }
     for (const g of data.groups) {
       const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map((x) => this.itemToNode(x)).filter((n) => n !== null);
-      if (kids.length > 0) root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
+      root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
     }
     return root;
   }
@@ -314,18 +314,21 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     for (const node of nodes) container.appendChild(this.renderNode(node));
   }
   renderNode(node) {
+    var _a, _b;
     const wrap = createDiv({ cls: "phb-node" });
     const row = wrap.createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
     if (node.kind === "group" || node.kind === "folder") {
+      const hasChildren = node.kind === "folder" || ((_b = (_a = node.children) == null ? void 0 : _a.length) != null ? _b : 0) > 0;
       const isOpen = this.expanded.has(this.nodeKey(node));
       const caret = row.createSpan({ cls: ["phb-caret", ...isOpen ? ["phb-open"] : []] });
       caret.innerHTML = ICON_CHEVRON;
+      if (!hasChildren) caret.addClass("phb-caret-empty");
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_FOLDER;
       row.createDiv({ cls: "phb-item-title", text: node.title });
       row.addEventListener("click", (e) => {
         e.stopPropagation();
-        this.toggleNode(node);
+        if (hasChildren) this.toggleNode(node);
       });
       if (isOpen) {
         const children = createDiv({ cls: "phb-children" });
@@ -397,6 +400,8 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     return [];
   }
   toggleNode(node) {
+    var _a, _b;
+    if (node.kind === "group" && ((_b = (_a = node.children) == null ? void 0 : _a.length) != null ? _b : 0) === 0) return;
     const key = this.nodeKey(node);
     if (this.expanded.has(key)) this.expanded.delete(key);
     else this.expanded.add(key);
@@ -415,7 +420,10 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   /* ------------------------------------------------------------------ */
   openFile(node) {
     var _a;
-    if (node.missing) return;
+    if (node.missing) {
+      this.closePopover();
+      return;
+    }
     const linktext = ((_a = node.path) != null ? _a : "") + (node.subpath ? "#" + node.subpath : "");
     void this.app.workspace.openLinkText(linktext, "", true);
     this.closePopover();

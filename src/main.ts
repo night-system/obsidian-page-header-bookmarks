@@ -327,11 +327,11 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		const root: TreeNode[] = [];
 
 		for (const it of data.items) {
-			if (it?.type === "group" && Array.isArray(it.items) && it.items.length > 0) {
-				const kids = it.items
+			if (it?.type === "group") {
+				const kids = (Array.isArray(it.items) ? it.items : [])
 					.map((x) => this.itemToNode(x))
 					.filter((n): n is TreeNode => n !== null);
-				if (kids.length > 0) root.push({ kind: "group", title: it.title || "未命名分组", children: kids });
+				root.push({ kind: "group", title: it.title || "未命名分组", children: kids });
 			} else {
 				const n = this.itemToNode(it);
 				if (n) root.push(n);
@@ -341,7 +341,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			const kids = (g?.items ?? [])
 				.map((x) => this.itemToNode(x))
 				.filter((n): n is TreeNode => n !== null);
-			if (kids.length > 0) root.push({ kind: "group", id: g?.id, title: g?.title || "未命名分组", children: kids });
+			root.push({ kind: "group", id: g?.id, title: g?.title || "未命名分组", children: kids });
 		}
 		return root;
 	}
@@ -400,15 +400,17 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		const row = wrap.createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
 
 		if (node.kind === "group" || node.kind === "folder") {
+			const hasChildren = node.kind === "folder" || (node.children?.length ?? 0) > 0;
 			const isOpen = this.expanded.has(this.nodeKey(node));
 			const caret = row.createSpan({ cls: ["phb-caret", ...(isOpen ? ["phb-open"] : [])] });
 			caret.innerHTML = ICON_CHEVRON;
+			if (!hasChildren) caret.addClass("phb-caret-empty");
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_FOLDER;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
 			row.addEventListener("click", (e: MouseEvent) => {
 				e.stopPropagation();
-				this.toggleNode(node);
+				if (hasChildren) this.toggleNode(node);
 			});
 			if (isOpen) {
 				const children = createDiv({ cls: "phb-children" });
@@ -482,6 +484,8 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	}
 
 	private toggleNode(node: TreeNode): void {
+		// Empty groups have nothing to expand.
+		if (node.kind === "group" && (node.children?.length ?? 0) === 0) return;
 		const key = this.nodeKey(node);
 		if (this.expanded.has(key)) this.expanded.delete(key);
 		else this.expanded.add(key);
@@ -502,7 +506,11 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	/* ------------------------------------------------------------------ */
 
 	private openFile(node: TreeNode): void {
-		if (node.missing) return;
+		if (node.missing) {
+			// Nothing to open, but still honour "any click on a file row closes".
+			this.closePopover();
+			return;
+		}
 		const linktext = (node.path ?? "") + (node.subpath ? "#" + node.subpath : "");
 		void this.app.workspace.openLinkText(linktext, "", true);
 		this.closePopover();

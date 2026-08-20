@@ -1,6 +1,6 @@
 {
   "name": "obsidian-page-header-bookmarks",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Bookmark icon in the page header; opens a popover with your core Bookmarks",
   "main": "main.js",
   "scripts": {

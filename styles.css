@@ -121,6 +121,10 @@
 	transform: rotate(90deg);
 }
 
+.phb-caret-empty {
+	opacity: 0;
+}
+
 .phb-item-title {
 	overflow: hidden;
 	text-overflow: ellipsis;
