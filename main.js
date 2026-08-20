@@ -27,7 +27,7 @@ __export(main_exports, {
   default: () => PageHeaderBookmarksPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian = require("obsidian");
+var import_obsidian2 = require("obsidian");
 
 // src/tree.ts
 function normalizePathForCompare(path) {
@@ -183,6 +183,791 @@ function dedupeTree(root, vault) {
   return prune(root);
 }
 
+// src/writeback.ts
+var BOOKMARKS_FILE = ".obsidian/bookmarks.json";
+var ITEM_TYPES = /* @__PURE__ */ new Set(["file", "folder", "search", "url", "graph", "group"]);
+function isGroupContainer(it) {
+  return !!it && typeof it === "object" && Array.isArray(it.items) && (it.type === "group" || it.type === void 0);
+}
+function groupContains(ancestor, candidate) {
+  let found = false;
+  const rec = (list) => {
+    if (found || !Array.isArray(list)) return;
+    for (const it of list) {
+      if (it === candidate) {
+        found = true;
+        return;
+      }
+      if (isGroupContainer(it)) rec(it.items);
+    }
+  };
+  rec(ancestor.items);
+  return found;
+}
+function locateItem(data, key) {
+  var _a;
+  if (!data) return null;
+  let result = null;
+  const searchList = (list, groupPath) => {
+    if (!Array.isArray(list)) return false;
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      if (key(it)) {
+        result = { item: it, parentList: list, index: i, groupPath, legacyGroup: false };
+        return true;
+      }
+      if (isGroupContainer(it)) {
+        const next = [...groupPath, it];
+        if (searchList(it.items, next)) return true;
+      }
+    }
+    return false;
+  };
+  if (searchList(data.items, [])) return result;
+  for (let i = 0; i < ((_a = data.groups) != null ? _a : []).length; i++) {
+    const g = data.groups[i];
+    if (key(g)) {
+      result = { item: g, parentList: data.groups, index: i, groupPath: [], legacyGroup: true };
+      return result;
+    }
+    if (searchList(g == null ? void 0 : g.items, [g])) return result;
+  }
+  return null;
+}
+function keyOrdinalOf(data, key, target) {
+  var _a;
+  if (!data) return -1;
+  let ordinal = 0;
+  const searchList = (list) => {
+    if (!Array.isArray(list)) return false;
+    for (const it of list) {
+      if (key(it)) {
+        if (it === target) return true;
+        ordinal++;
+      }
+      if (isGroupContainer(it) && searchList(it.items)) return true;
+    }
+    return false;
+  };
+  if (searchList(data.items)) return ordinal;
+  for (const g of (_a = data.groups) != null ? _a : []) {
+    if (key(g)) {
+      if (g === target) return ordinal;
+      ordinal++;
+    }
+    if (searchList(g == null ? void 0 : g.items)) return ordinal;
+  }
+  return -1;
+}
+function locateItemAtOrdinal(data, key, ordinal) {
+  if (!data || !(ordinal >= 0)) return null;
+  let skipped = 0;
+  return locateItem(data, (it) => key(it) && skipped++ >= ordinal);
+}
+function collectGroups(data) {
+  var _a, _b;
+  const out = [];
+  const rec = (list, prefix, legacy) => {
+    var _a2;
+    for (const it of list != null ? list : []) {
+      if (it.type === "group" || it.type === void 0 && Array.isArray(it.items)) {
+        const title = (_a2 = it.title) != null ? _a2 : "";
+        out.push({ group: it, label: [...prefix, title].join(" / "), depth: prefix.length, legacy });
+        if (Array.isArray(it.items)) rec(it.items, [...prefix, title], false);
+      }
+    }
+  };
+  rec(data == null ? void 0 : data.items, [], false);
+  for (const g of (_a = data == null ? void 0 : data.groups) != null ? _a : []) {
+    const title = (_b = g == null ? void 0 : g.title) != null ? _b : "";
+    out.push({ group: g, label: title, depth: 0, legacy: true });
+    rec(g == null ? void 0 : g.items, [title], true);
+  }
+  return out;
+}
+function groupChoicesFor(data, item) {
+  const all = collectGroups(data);
+  if (!item || !isGroupContainer(item)) return all;
+  const exclude = /* @__PURE__ */ new Set([item]);
+  const rec = (list) => {
+    for (const it of list != null ? list : []) {
+      if (it.type === "group") {
+        exclude.add(it);
+        rec(it.items);
+      }
+    }
+  };
+  rec(item.items);
+  return all.filter((e) => !exclude.has(e.group));
+}
+function countGroupItems(group) {
+  let n = 0;
+  const rec = (list) => {
+    for (const it of list != null ? list : []) {
+      if (isGroupContainer(it)) rec(it.items);
+      else n++;
+    }
+  };
+  rec(group.items);
+  return n;
+}
+function moveItemInData(data, item, target, index) {
+  var _a, _b, _c;
+  if (!data || !item) return false;
+  const loc = locateItem(data, (it) => it === item);
+  if (!loc) return false;
+  if (target !== null) {
+    if (!locateItem(data, (it) => it === target)) return false;
+    if (!isGroupContainer(target)) return false;
+    if (loc.legacyGroup) return false;
+    if (isGroupContainer(item) && (target === item || groupContains(item, target))) return false;
+  } else if (loc.legacyGroup) {
+    const groups = (_a = data.groups) != null ? _a : data.groups = [];
+    let insertAt2 = index;
+    const at = groups.indexOf(loc.item);
+    if (at !== -1 && typeof insertAt2 === "number" && insertAt2 > at) insertAt2--;
+    groups.splice(at, 1);
+    if (typeof insertAt2 === "number" && insertAt2 >= 0) groups.splice(Math.min(insertAt2, groups.length), 0, loc.item);
+    else groups.push(loc.item);
+    return true;
+  }
+  const targetList = target !== null ? (_b = target.items) != null ? _b : target.items = [] : (_c = data.items) != null ? _c : data.items = [];
+  let insertAt = index;
+  if (loc.parentList === targetList && typeof insertAt === "number" && insertAt > loc.index) insertAt--;
+  loc.parentList.splice(loc.index, 1);
+  if (typeof insertAt === "number" && insertAt >= 0) targetList.splice(Math.min(insertAt, targetList.length), 0, item);
+  else targetList.push(item);
+  return true;
+}
+function applyMoveToGroupChoice(data, item, target, containerKey) {
+  var _a, _b;
+  if (!data || !item) return false;
+  if (target === null) return moveItemInData(data, item, null);
+  const byId = locateItem(data, (it) => it === target);
+  const container = byId ? byId.item : (_b = (_a = locateItem(data, containerKey(target))) == null ? void 0 : _a.item) != null ? _b : null;
+  if (!container) return false;
+  return moveItemInData(data, item, container);
+}
+function removeItemFromData(data, item) {
+  const loc = locateItem(data, (it) => it === item);
+  if (!loc) return false;
+  loc.parentList.splice(loc.index, 1);
+  return true;
+}
+function renameItemInData(item, newTitle) {
+  if (item) item.title = newTitle;
+}
+function validateBookmarksData(data) {
+  var _a;
+  const errors = [];
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { ok: false, errors: ["data \u4E0D\u662F\u5BF9\u8C61"] };
+  }
+  const d = data;
+  if (!Array.isArray(d.items)) errors.push("items \u5FC5\u987B\u662F\u6570\u7EC4");
+  if (d.groups !== void 0 && !Array.isArray(d.groups)) errors.push("groups \u5FC5\u987B\u662F\u6570\u7EC4");
+  const checkItems = (list, where) => {
+    if (!Array.isArray(list)) return;
+    list.forEach((it, i) => {
+      if (!it || typeof it !== "object") {
+        errors.push(`${where}[${i}] \u4E0D\u662F\u5BF9\u8C61`);
+        return;
+      }
+      const type = it.type;
+      if (typeof type !== "string" || !ITEM_TYPES.has(type)) {
+        errors.push(`${where}[${i}] type \u975E\u6CD5: ${String(type)}`);
+        return;
+      }
+      if (type === "group") {
+        if (!Array.isArray(it.items)) errors.push(`${where}[${i}] group \u7F3A\u5C11 items \u6570\u7EC4`);
+        else checkItems(it.items, `${where}[${i}].items`);
+      }
+    });
+  };
+  checkItems(d.items, "items");
+  ((_a = d.groups) != null ? _a : []).forEach((g, i) => {
+    if (!g || typeof g !== "object") {
+      errors.push(`groups[${i}] \u4E0D\u662F\u5BF9\u8C61`);
+      return;
+    }
+    if (!Array.isArray(g.items)) errors.push(`groups[${i}] \u7F3A\u5C11 items \u6570\u7EC4`);
+    else checkItems(g.items, `groups[${i}].items`);
+  });
+  return { ok: errors.length === 0, errors };
+}
+function parseBookmarksFile(raw) {
+  if (!raw) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const p = parsed;
+  if (!Array.isArray(p.items) && !Array.isArray(p.groups)) return null;
+  return {
+    items: Array.isArray(p.items) ? p.items : [],
+    groups: Array.isArray(p.groups) ? p.groups : []
+  };
+}
+function cloneBookmarksData(data) {
+  if (!data) return { items: [] };
+  return JSON.parse(JSON.stringify(data));
+}
+function restoreData(target, backup) {
+  var _a, _b;
+  if (!target) return;
+  if (Array.isArray(target.items)) {
+    target.items.splice(0, target.items.length, ...(_a = backup.items) != null ? _a : []);
+  } else if (Array.isArray(backup.items)) {
+    target.items = [...backup.items];
+  }
+  if (target.groups || backup.groups) {
+    const tg = Array.isArray(target.groups) ? target.groups : target.groups = [];
+    tg.splice(0, tg.length, ...(_b = backup.groups) != null ? _b : []);
+  }
+}
+function mapNodesToRaw(nodes, data, vault) {
+  var _a;
+  const map = /* @__PURE__ */ new Map();
+  if (!data || !vault) return map;
+  const flat = [];
+  {
+    const walk = (list) => {
+      for (const n of list) {
+        flat.push(n);
+        if (n.children) walk(n.children);
+      }
+    };
+    walk(nodes);
+  }
+  const coveredB = { objects: /* @__PURE__ */ new Set(), paths: /* @__PURE__ */ new Set() };
+  for (const n of flat) {
+    if (n.kind === "folder" && n.path) {
+      const exp = collectFolderExpansion(n, vault);
+      exp.objects.forEach((o) => coveredB.objects.add(o));
+      exp.paths.forEach((p) => coveredB.paths.add(p));
+    }
+  }
+  const bDoomed = (n) => {
+    if (n.kind !== "file" && n.kind !== "folder") return false;
+    if (!n.path) return false;
+    const obj = vault.getAbstractFileByPath(n.path);
+    return !!obj && coveredB.objects.has(obj) || coveredB.paths.has(normalizePathForCompare(n.path));
+  };
+  const coveredA = computeCovered(data, vault);
+  let cursor = 0;
+  const assign = (it) => {
+    if (cursor < flat.length) {
+      map.set(flat[cursor], it);
+      cursor++;
+    }
+  };
+  const visit = (list) => {
+    for (const it of list != null ? list : []) {
+      if (isCovered(coveredA, it, vault)) continue;
+      if (it.type === "group") {
+        assign(it);
+        visit(it.items);
+        continue;
+      }
+      const n = itemToNode(it, vault);
+      if (!n) continue;
+      if (bDoomed(n)) continue;
+      assign(it);
+    }
+  };
+  visit(data.items);
+  for (const g of (_a = data.groups) != null ? _a : []) {
+    assign(g);
+    visit(g == null ? void 0 : g.items);
+  }
+  return map;
+}
+function sameJson(a, b) {
+  try {
+    return JSON.stringify(JSON.parse(a)) === JSON.stringify(JSON.parse(b));
+  } catch (e) {
+    return false;
+  }
+}
+async function restoreBackup(adapter, filePath, backupPath) {
+  var _a, _b;
+  try {
+    const bk = await ((_a = adapter.read) == null ? void 0 : _a.call(adapter, backupPath));
+    if (typeof bk === "string") await ((_b = adapter.write) == null ? void 0 : _b.call(adapter, filePath, bk));
+  } catch (e) {
+  }
+}
+async function applyToFile(adapter, data, filePath = BOOKMARKS_FILE) {
+  if (!adapter || typeof adapter.read !== "function" || typeof adapter.write !== "function") {
+    return { ok: false, reason: "no-adapter" };
+  }
+  const v = validateBookmarksData(data);
+  if (!v.ok) return { ok: false, reason: "invalid-data", error: v.errors };
+  const backupPath = filePath + ".bak-phb";
+  let current = "";
+  try {
+    current = await adapter.read(filePath);
+  } catch (e) {
+    return { ok: false, reason: "read-failed", error: e };
+  }
+  try {
+    if (typeof adapter.copy === "function") await adapter.copy(filePath, backupPath);
+    else await adapter.write(backupPath, current);
+  } catch (e) {
+    return { ok: false, reason: "backup-failed", error: e };
+  }
+  const serialized = JSON.stringify(data, null, 2) + "\n";
+  try {
+    await adapter.write(filePath, serialized);
+  } catch (e) {
+    await restoreBackup(adapter, filePath, backupPath);
+    return { ok: false, reason: "write-failed", error: e };
+  }
+  try {
+    const reread = await adapter.read(filePath);
+    if (!sameJson(reread, serialized)) throw new Error("verification mismatch");
+  } catch (e) {
+    await restoreBackup(adapter, filePath, backupPath);
+    return { ok: false, reason: "verify-failed", error: e };
+  }
+  return { ok: true };
+}
+async function commitWrite(source, mutate) {
+  const backup = cloneBookmarksData(source.data);
+  if (source.mode === "file") {
+    const v = validateBookmarksData(source.data);
+    if (!v.ok) return { ok: false, reason: "invalid-data", error: v.errors };
+  }
+  let accepted = false;
+  try {
+    accepted = mutate(source.data);
+  } catch (e) {
+    restoreData(source.data, backup);
+    return { ok: false, reason: "mutate-error", error: e };
+  }
+  if (!accepted) return { ok: false, reason: "rejected" };
+  if (source.mode === "instance") {
+    const inst = source.instance;
+    try {
+      let persisted = false;
+      if (inst && typeof inst.onItemsChanged === "function") {
+        inst.onItemsChanged(true);
+        persisted = true;
+      } else if (inst && typeof inst.saveData === "function") {
+        inst.saveData();
+        persisted = true;
+      }
+      if (!persisted && source.adapter) {
+        const r = await applyToFile(source.adapter, source.data, source.filePath);
+        if (!r.ok) {
+          restoreData(source.data, backup);
+          return r;
+        }
+      }
+    } catch (e) {
+      restoreData(source.data, backup);
+      return { ok: false, reason: "persist-error", error: e };
+    }
+    return { ok: true };
+  }
+  try {
+    const r = await applyToFile(source.adapter, source.data, source.filePath);
+    if (!r.ok) {
+      restoreData(source.data, backup);
+      return r;
+    }
+    if (source.instance && typeof source.instance.loadData === "function") {
+      try {
+        await source.instance.loadData();
+      } catch (e) {
+      }
+    }
+    return { ok: true };
+  } catch (e) {
+    restoreData(source.data, backup);
+    return { ok: false, reason: "file-error", error: e };
+  }
+}
+
+// src/dnd.ts
+var DRAG_HOLD_MS = 400;
+var MENU_HOLD_MS = 600;
+var SCROLL_SLOP = 5;
+var TOUCH_DRAG_SLOP = 10;
+var MOUSE_DRAG_SLOP = 4;
+var SCROLL_EDGE = 36;
+var SCROLL_STEP = 12;
+var CLICK_SUPPRESS_RESET_MS = 500;
+function computeDropMode(rect, clientY, isGroup) {
+  if (!rect || !(rect.height > 0)) return null;
+  const y = (clientY - rect.top) / rect.height;
+  if (y < 0 || y > 1) return null;
+  if (isGroup) {
+    if (y < 0.25) return "before";
+    if (y > 0.75) return "after";
+    return "into";
+  }
+  return y <= 0.5 ? "before" : "after";
+}
+function needsAutoScroll(listRect, y, edge = SCROLL_EDGE) {
+  if (y < listRect.top + edge) return "up";
+  if (y > listRect.bottom - edge) return "down";
+  return null;
+}
+function computeDropAction(data, dragItem, targetItem, mode) {
+  var _a;
+  if (mode === "top") {
+    return { ok: true, target: null, index: void 0 };
+  }
+  if (!targetItem) return { ok: false, reason: "no-target", target: null };
+  if (targetItem === dragItem) return { ok: false, reason: "self", target: null };
+  const dragLoc = locateItem(data, (it) => it === dragItem);
+  if (!dragLoc) return { ok: false, reason: "not-found", target: null };
+  if (mode === "into") {
+    if (!isGroupContainer(targetItem)) return { ok: false, reason: "not-group", target: null };
+    if (dragLoc.legacyGroup) return { ok: false, reason: "legacy-group-into", target: null };
+    if (dragLoc.parentList === targetItem.items) return { ok: false, reason: "same-container", target: null };
+    if (isGroupContainer(dragItem) && groupContains(dragItem, targetItem)) {
+      return { ok: false, reason: "group-descendant", target: null };
+    }
+    return { ok: true, target: targetItem, index: void 0 };
+  }
+  const tLoc = locateItem(data, (it) => it === targetItem);
+  if (!tLoc) return { ok: false, reason: "target-not-found", target: null };
+  if (isGroupContainer(dragItem) && groupContains(dragItem, targetItem)) {
+    return { ok: false, reason: "group-descendant", target: null };
+  }
+  if (dragLoc.legacyGroup) {
+    if (!tLoc.legacyGroup) return { ok: false, reason: "legacy-group-cross", target: null };
+    return { ok: true, target: null, index: tLoc.index + (mode === "after" ? 1 : 0) };
+  }
+  if (tLoc.legacyGroup) {
+    return { ok: true, target: null, index: void 0 };
+  }
+  const targetContainer = (_a = tLoc.groupPath[tLoc.groupPath.length - 1]) != null ? _a : null;
+  return { ok: true, target: targetContainer, index: tLoc.index + (mode === "after" ? 1 : 0) };
+}
+function resolvePointerEnd(kind, active, target) {
+  if (kind === "cancel") return null;
+  if (!active || target.kind === "none") return null;
+  return target;
+}
+var ClickSuppressor = class {
+  constructor(resetMs, schedule, cancel) {
+    this.resetMs = resetMs;
+    this.schedule = schedule;
+    this.cancel = cancel;
+    this.active = false;
+    this.timer = null;
+  }
+  isActive() {
+    return this.active;
+  }
+  /** Arm (true) or clear (false) the suppression; arming restarts the reset window. */
+  setActive(v) {
+    this.active = v;
+    if (this.timer !== null) {
+      this.cancel(this.timer);
+      this.timer = null;
+    }
+    if (v && this.resetMs > 0) {
+      this.timer = this.schedule(() => {
+        this.timer = null;
+        this.active = false;
+      }, this.resetMs);
+    }
+  }
+  /** Consume the flag; true = this click must be swallowed. */
+  consume() {
+    if (!this.active) return false;
+    this.active = false;
+    if (this.timer !== null) {
+      this.cancel(this.timer);
+      this.timer = null;
+    }
+    return true;
+  }
+};
+function attachRowDrag(row, opts, state) {
+  var _a, _b;
+  let drag = null;
+  let pressTimer = null;
+  let menuTimer = null;
+  const isBookmark = (_a = opts.isBookmarkRow) != null ? _a : () => true;
+  const isGroup = (_b = opts.isGroupRow) != null ? _b : (r) => r.classList.contains("phb-item-group");
+  const clearTimers = () => {
+    if (pressTimer !== null) {
+      window.clearTimeout(pressTimer);
+      pressTimer = null;
+    }
+    if (menuTimer !== null) {
+      window.clearTimeout(menuTimer);
+      menuTimer = null;
+    }
+  };
+  const clearDropMarks = () => {
+    for (const el of Array.from(opts.listEl.querySelectorAll(".phb-item"))) {
+      el.classList.remove("phb-drop-into", "phb-drop-above", "phb-drop-below");
+    }
+  };
+  const dropTargetAt = (e) => {
+    const d = drag;
+    if (!d) return { kind: "none" };
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const hit = under instanceof HTMLElement ? under.closest(".phb-item") : null;
+    if (!(hit instanceof HTMLElement)) {
+      const inList = under instanceof HTMLElement && under.closest(".phb-popover-list") !== null;
+      return inList ? { kind: "empty" } : { kind: "none" };
+    }
+    if (hit === row) return { kind: "none" };
+    if (!isBookmark(hit)) return { kind: "none" };
+    const rect = hit.getBoundingClientRect();
+    const mode = computeDropMode(rect, e.clientY, isGroup(hit));
+    if (!mode) return { kind: "none" };
+    return { kind: "row", row: hit, mode };
+  };
+  const showDropTarget = (e) => {
+    clearDropMarks();
+    const hit = dropTargetAt(e);
+    if (hit.kind !== "row") return;
+    if (hit.mode === "into") hit.row.classList.add("phb-drop-into");
+    else if (hit.mode === "after") hit.row.classList.add("phb-drop-below");
+    else hit.row.classList.add("phb-drop-above");
+  };
+  const autoScroll = (e) => {
+    const list = opts.listEl;
+    const rect = list.getBoundingClientRect();
+    const dir = needsAutoScroll(rect, e.clientY);
+    if (dir === "up") list.scrollTop -= SCROLL_STEP;
+    else if (dir === "down") list.scrollTop += SCROLL_STEP;
+  };
+  const endDrag = () => {
+    var _a2;
+    clearTimers();
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
+    document.removeEventListener("pointercancel", onPointerCancel);
+    document.removeEventListener("touchmove", onTouchMove);
+    if (drag) {
+      row.classList.remove("phb-item-dragging", "phb-press");
+      opts.listEl.classList.remove("phb-drag-active");
+      (_a2 = opts.onDragChange) == null ? void 0 : _a2.call(opts, false);
+    }
+    clearDropMarks();
+    drag = null;
+  };
+  const onTouchMove = (e) => {
+    if (drag == null ? void 0 : drag.armed) e.preventDefault();
+  };
+  const onPointerMove = (e) => {
+    var _a2;
+    const d = drag;
+    if (!d || e.pointerId !== d.pointerId) return;
+    if (d.menuShown) return;
+    const dist = Math.max(Math.abs(e.clientX - d.startX), Math.abs(e.clientY - d.startY));
+    if (!d.active) {
+      if (!d.armed) {
+        if (dist > SCROLL_SLOP) endDrag();
+        return;
+      }
+      if (dist <= (e.pointerType === "mouse" ? MOUSE_DRAG_SLOP : TOUCH_DRAG_SLOP)) return;
+      if (menuTimer !== null) {
+        window.clearTimeout(menuTimer);
+        menuTimer = null;
+      }
+      d.active = true;
+      row.classList.add("phb-item-dragging");
+      opts.listEl.classList.add("phb-drag-active");
+      (_a2 = opts.onDragChange) == null ? void 0 : _a2.call(opts, true);
+    }
+    e.preventDefault();
+    showDropTarget(e);
+    autoScroll(e);
+  };
+  const onPointerUp = (e) => {
+    var _a2;
+    const d = drag;
+    if (!d) return;
+    const dropped = resolvePointerEnd("up", d.active, dropTargetAt(e));
+    endDrag();
+    if (dropped) (_a2 = opts.onDrop) == null ? void 0 : _a2.call(opts, dropped);
+  };
+  const onPointerCancel = () => {
+    if (!drag) return;
+    endDrag();
+  };
+  const onPointerDown = (e) => {
+    var _a2;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    if ((_a2 = e.target) == null ? void 0 : _a2.closest("input, button")) return;
+    const byTouch = e.pointerType !== "mouse";
+    if (byTouch) state.lastTouchAt = Date.now();
+    drag = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      armed: !byTouch,
+      active: false,
+      menuShown: false
+    };
+    if (byTouch) {
+      pressTimer = window.setTimeout(() => {
+        pressTimer = null;
+        if (!drag) return;
+        drag.armed = true;
+        row.classList.add("phb-press");
+        opts.listEl.classList.add("phb-drag-active");
+      }, DRAG_HOLD_MS);
+      menuTimer = window.setTimeout(() => {
+        menuTimer = null;
+        const d = drag;
+        if (!d || d.active || !opts.onMenu) return;
+        d.menuShown = true;
+        opts.onMenu({ x: e.clientX, y: e.clientY });
+      }, MENU_HOLD_MS);
+    }
+    document.addEventListener("pointermove", onPointerMove, { passive: false });
+    document.addEventListener("pointerup", onPointerUp);
+    document.addEventListener("pointercancel", onPointerCancel);
+    if (byTouch) document.addEventListener("touchmove", onTouchMove, { passive: false });
+  };
+  row.addEventListener("pointerdown", onPointerDown);
+}
+
+// src/menu.ts
+var import_obsidian = require("obsidian");
+var LABELS = {
+  open: "\u6253\u5F00",
+  openNewTab: "\u65B0\u6807\u7B7E\u9875\u6253\u5F00",
+  copyFile: "\u590D\u5236\u94FE\u63A5",
+  copySearch: "\u590D\u5236\u67E5\u8BE2",
+  rename: "\u91CD\u547D\u540D",
+  moveToGroup: "\u79FB\u52A8\u5230\u5206\u7EC4\u2026",
+  delete: "\u5220\u9664",
+  toggleExpand: "\u5C55\u5F00",
+  toggleCollapse: "\u6536\u8D77"
+};
+function buildMenuItemDefs(node, opts = {}) {
+  var _a;
+  const defs = [];
+  const writable = !opts.readonly;
+  if (node.kind === "group" || node.kind === "folder") {
+    if (opts.canToggle !== false) {
+      const toggleTitle = opts.expanded ? LABELS.toggleCollapse : LABELS.toggleExpand;
+      defs.push({ id: "toggle", title: toggleTitle, icon: "chevron-right" });
+    }
+  } else {
+    defs.push({ id: "open", title: LABELS.open, icon: "file" });
+    defs.push({ id: "openNewTab", title: LABELS.openNewTab, icon: "file-plus" });
+    if (node.kind === "file" || node.kind === "search" || node.kind === "url") {
+      const copyTitle = node.kind === "search" ? LABELS.copySearch : LABELS.copyFile;
+      defs.push({ id: "copy", title: copyTitle, icon: "link" });
+    }
+  }
+  if (!writable) return defs;
+  defs.push({ id: "rename", title: LABELS.rename, icon: "pencil", separatorBefore: true });
+  defs.push({ id: "moveToGroup", title: LABELS.moveToGroup, icon: "folder-input" });
+  const isGroup = node.kind === "group";
+  const deleteDef = { id: "delete", title: LABELS.delete, icon: "trash", separatorBefore: true };
+  if (isGroup) {
+    deleteDef.dangerous = true;
+    deleteDef.confirm = `\u5220\u9664\u5206\u7EC4\u300C${node.title}\u300D\u5C06\u540C\u65F6\u5220\u9664\u7EC4\u5185 ${(_a = opts.groupItemCount) != null ? _a : 0} \u4E2A\u4E66\u7B7E\uFF0C\u6B64\u64CD\u4F5C\u4E0D\u53EF\u64A4\u9500\u3002`;
+  }
+  defs.push(deleteDef);
+  return defs;
+}
+function showNodeMenu(app, node, pos, opts, handlers, onHide) {
+  const defs = buildMenuItemDefs(node, opts);
+  const menu = new import_obsidian.Menu();
+  for (const def of defs) {
+    if (def.separatorBefore) menu.addSeparator();
+    menu.addItem((item) => {
+      item.setTitle(def.title).setIcon(def.icon);
+      item.onClick(() => {
+        var _a;
+        return (_a = handlers[def.id]) == null ? void 0 : _a.call(handlers);
+      });
+    });
+  }
+  if (onHide) menu.onHide(onHide);
+  menu.showAtPosition(pos);
+}
+var RenameModal = class extends import_obsidian.Modal {
+  constructor(app, initial, onSubmit) {
+    super(app);
+    this.onSubmit = onSubmit;
+    this.value = initial;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    this.setTitle("\u91CD\u547D\u540D\u4E66\u7B7E");
+    new import_obsidian.Setting(contentEl).addText((t) => {
+      t.setValue(this.value).onChange((v) => this.value = v);
+      t.inputEl.focus();
+      t.inputEl.select();
+      t.inputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") this.submit();
+      });
+    });
+    new import_obsidian.Setting(contentEl).addButton((b) => b.setButtonText("\u786E\u5B9A").setCta().onClick(() => this.submit())).addButton((b) => b.setButtonText("\u53D6\u6D88").onClick(() => this.close()));
+  }
+  submit() {
+    const v = this.value.trim();
+    this.close();
+    if (v) this.onSubmit(v);
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var GroupPickerModal = class extends import_obsidian.FuzzySuggestModal {
+  constructor(app, choices, onPick) {
+    super(app);
+    this.choices = choices;
+    this.onPick = onPick;
+    this.setPlaceholder("\u9009\u62E9\u76EE\u6807\u5206\u7EC4");
+  }
+  getItems() {
+    return this.choices;
+  }
+  getItemText(item) {
+    return item.label;
+  }
+  renderSuggestion(match, el) {
+    var _a;
+    const segs = match.item.label.split(" / ");
+    el.setText((_a = segs[segs.length - 1]) != null ? _a : match.item.label);
+    el.style.paddingLeft = `${8 + (segs.length - 1) * 16}px`;
+  }
+  onChooseItem(item) {
+    this.onPick(item.group);
+  }
+};
+var ConfirmModal = class extends import_obsidian.Modal {
+  constructor(app, body, onConfirm) {
+    super(app);
+    this.body = body;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "\u786E\u8BA4\u5220\u9664" });
+    contentEl.createEl("p", { text: this.body });
+    new import_obsidian.Setting(contentEl).addButton(
+      (b) => b.setButtonText("\u5220\u9664").setWarning().onClick(() => {
+        this.close();
+        this.onConfirm();
+      })
+    ).addButton((b) => b.setButtonText("\u53D6\u6D88").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
 // src/main.ts
 var ICON_FOLDER = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`;
 var ICON_FILE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>`;
@@ -191,7 +976,7 @@ var ICON_LINK = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" 
 var ICON_GRAPH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>`;
 var ICON_CHEVRON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`;
 var ICON_CLOSE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`;
-var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
+var PageHeaderBookmarksPlugin = class extends import_obsidian2.Plugin {
   constructor() {
     super(...arguments);
     /** Injected page-header buttons, keyed by the view they belong to. */
@@ -201,6 +986,26 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     this.anchor = null;
     this.listEl = null;
     this.expanded = /* @__PURE__ */ new Set();
+    /** Rendered row → raw bookmark item / tree node (for menu & drag). */
+    this.rowItems = /* @__PURE__ */ new WeakMap();
+    this.rowNodes = /* @__PURE__ */ new WeakMap();
+    /**
+     * Suppresses the click synthesized after a touch long-press / drag.
+     * Auto-resets after CLICK_SUPPRESS_RESET_MS when never consumed — a
+     * drag re-render may remove the row that would have consumed it, and a
+     * stale flag must not swallow an unrelated later row click.
+     */
+    this.clickSuppressor = new ClickSuppressor(
+      CLICK_SUPPRESS_RESET_MS,
+      (fn, ms) => window.setTimeout(fn, ms),
+      (id) => window.clearTimeout(id)
+    );
+    /** Render-time same-key ordinal of each tree node (duplicate-safe re-location). */
+    this.renderOrdinals = /* @__PURE__ */ new WeakMap();
+    /** Shared long-press timestamp (touch-synthesized contextmenu filter). */
+    this.gestureState = { lastTouchAt: 0 };
+    /** How the current data can be written back ("none" = read-only). */
+    this.writeMode = "none";
     this.keyHandler = (e) => {
       if (e.key === "Escape") this.closePopover();
     };
@@ -236,7 +1041,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   }
   addButtonToLeaf(leaf) {
     const view = leaf.view;
-    if (!(view instanceof import_obsidian.ItemView)) return;
+    if (!(view instanceof import_obsidian2.ItemView)) return;
     if (this.buttons.has(view)) return;
     const button = view.addAction("bookmark", "\u4E66\u7B7E", () => {
       this.togglePopover(button);
@@ -247,7 +1052,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   removeButtonsFromAllLeaves() {
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view;
-      if (!(view instanceof import_obsidian.ItemView)) return;
+      if (!(view instanceof import_obsidian2.ItemView)) return;
       const button = this.buttons.get(view);
       if (button) {
         button.detach();
@@ -321,54 +1126,71 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   /* Data resolution                                                     */
   /* ------------------------------------------------------------------ */
   /**
-   * Fetch bookmark data from every source we know about, newest first:
+   * Fetch bookmark data from every source we know about, newest first
+   * (same priority as v1.0.7, plus write-back metadata):
    *   1. live instances (`app.bookmarks`, `app.internalPlugins…instance`)
    *      — the `items` tree is authoritative (it preserves group nesting),
    *      so prefer it over the `getBookmarks()` flat list, which may
    *      float group-nested items up to the top level;
    *   2. the core plugin's data file `.obsidian/bookmarks.json` (most
    *      reliable across versions; read on demand so it is always fresh).
+   *
+   * `mode` describes how the data can be written back:
+   *   - "instance"  → mutate `instance.items` + onItemsChanged(true);
+   *   - "file"      → write `.obsidian/bookmarks.json` (backup + verify);
+   *   - "none"      → read-only (e.g. data came from a flat getBookmarks()
+   *                   list, which cannot be written back safely).
    */
   async resolveBookmarks() {
-    var _a, _b, _c;
-    const liveSources = [];
+    var _a, _b, _c, _d, _e, _f;
+    const instances = [];
     try {
-      liveSources.push(this.app.bookmarks);
+      const b = this.app.bookmarks;
+      if (b) instances.push(b);
     } catch (e) {
     }
     try {
-      liveSources.push(
-        (_c = (_b = (_a = this.app.internalPlugins) == null ? void 0 : _a.plugins) == null ? void 0 : _b.bookmarks) == null ? void 0 : _c.instance
-      );
+      const inst = (_c = (_b = (_a = this.app.internalPlugins) == null ? void 0 : _a.plugins) == null ? void 0 : _b.bookmarks) == null ? void 0 : _c.instance;
+      if (inst && !instances.includes(inst)) instances.push(inst);
     } catch (e) {
     }
-    for (const source of liveSources) {
-      if (!source) continue;
+    let adapter = null;
+    try {
+      adapter = (_d = this.app.vault.adapter) != null ? _d : null;
+    } catch (e) {
+    }
+    for (const inst of instances) {
       try {
-        const s = source;
-        const items = Array.isArray(s.items) ? s.items : [];
-        const groups = Array.isArray(s.groups) ? s.groups : [];
-        if (items.length > 0 || groups.length > 0) return { items, groups };
-        if (typeof s.getBookmarks === "function") {
-          const flat = s.getBookmarks();
-          if (Array.isArray(flat) && flat.length > 0) return { items: flat, groups: [] };
+        const items = Array.isArray(inst.items) ? inst.items : [];
+        const rawGroups = inst.groups;
+        const groups = Array.isArray(rawGroups) ? rawGroups : [];
+        if (items.length > 0 || groups.length > 0) {
+          return {
+            data: { items, groups },
+            mode: "instance",
+            instance: inst,
+            adapter
+          };
+        }
+        if (typeof inst.getBookmarks === "function") {
+          const flat = (_e = inst.getBookmarks) == null ? void 0 : _e.call(inst);
+          if (Array.isArray(flat) && flat.length > 0) {
+            return { data: { items: flat, groups: [] }, mode: "none", instance: inst, adapter };
+          }
         }
       } catch (e) {
       }
     }
-    try {
-      const adapter = this.app.vault.adapter;
-      if (adapter && typeof adapter.read === "function") {
-        const raw = await adapter.read(".obsidian/bookmarks.json");
-        if (raw) {
-          const data = JSON.parse(raw);
-          return {
-            items: Array.isArray(data == null ? void 0 : data.items) ? data.items : [],
-            groups: Array.isArray(data == null ? void 0 : data.groups) ? data.groups : []
-          };
+    if (adapter && typeof adapter.read === "function") {
+      try {
+        const raw = await adapter.read(BOOKMARKS_FILE);
+        const parsed = parseBookmarksFile(raw);
+        if (parsed) {
+          const mode = typeof adapter.write === "function" ? "file" : "none";
+          return { data: parsed, mode, instance: (_f = instances[0]) != null ? _f : null, adapter };
         }
+      } catch (e) {
       }
-    } catch (e) {
     }
     return null;
   }
@@ -376,8 +1198,11 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   /* Rendering                                                           */
   /* ------------------------------------------------------------------ */
   async renderInto(list) {
+    var _a, _b;
     list.empty();
-    const data = await this.resolveBookmarks();
+    const resolved = await this.resolveBookmarks();
+    const data = (_a = resolved == null ? void 0 : resolved.data) != null ? _a : null;
+    this.writeMode = (_b = resolved == null ? void 0 : resolved.mode) != null ? _b : "none";
     if (!data) {
       list.createDiv({
         cls: "phb-empty",
@@ -385,8 +1210,8 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       });
       const enableBtn = list.createEl("button", { cls: "phb-enable", text: "\u542F\u7528\u4E66\u7B7E\u63D2\u4EF6" });
       enableBtn.addEventListener("click", () => {
-        var _a, _b, _c, _d;
-        void ((_d = (_c = (_b = (_a = this.app.internalPlugins) == null ? void 0 : _a.plugins) == null ? void 0 : _b.bookmarks) == null ? void 0 : _c.enable) == null ? void 0 : _d.call(_c));
+        var _a2, _b2, _c, _d;
+        void ((_d = (_c = (_b2 = (_a2 = this.app.internalPlugins) == null ? void 0 : _a2.plugins) == null ? void 0 : _b2.bookmarks) == null ? void 0 : _c.enable) == null ? void 0 : _d.call(_c));
         window.setTimeout(() => {
           void this.renderInto(list).then(() => this.positionPopover());
         }, 200);
@@ -401,7 +1226,29 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       });
       return;
     }
-    this.renderNodes(list, nodes);
+    const map = mapNodesToRaw(nodes, data, this.app.vault);
+    this.renderOrdinals = this.computeRenderOrdinals(nodes, data, map);
+    this.renderNodes(list, nodes, map);
+  }
+  /**
+   * Same-key ordinal of each rendered node in `data` (0-based, in data
+   * DFS order). After a file-mode re-read the render reference is a
+   * different object, so locateIn uses this ordinal to hit the exact
+   * duplicate bookmark instead of always the first same-key match.
+   */
+  computeRenderOrdinals(nodes, data, map) {
+    const ordinals = /* @__PURE__ */ new WeakMap();
+    const stack = [...nodes];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      const raw = map.get(node);
+      if (raw) {
+        const ord = keyOrdinalOf(data, this.itemKeyOf(node), raw);
+        if (ord >= 0) ordinals.set(node, ord);
+      }
+      if (node.children) stack.push(...node.children);
+    }
+    return ordinals;
   }
   /** Stable identity for a tree node, used to keep expansion state across re-renders. */
   nodeKey(node) {
@@ -423,15 +1270,25 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
         return "";
     }
   }
-  renderNodes(container, nodes) {
-    for (const node of nodes) container.appendChild(this.renderNode(node));
+  renderNodes(container, nodes, map) {
+    for (const node of nodes) container.appendChild(this.renderNode(node, map));
   }
-  renderNode(node) {
-    var _a, _b;
+  renderNode(node, map) {
+    var _a, _b, _c;
     const wrap = createDiv({ cls: "phb-node" });
-    const row = wrap.createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
+    const row = createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
+    const raw = (_a = map.get(node)) != null ? _a : null;
+    if (raw) {
+      this.rowItems.set(row, raw);
+      this.rowNodes.set(row, node);
+    }
+    const guard = (fn) => (e) => {
+      e.stopPropagation();
+      if (this.consumeSuppressedClick()) return;
+      fn();
+    };
     if (node.kind === "group" || node.kind === "folder") {
-      const hasChildren = node.kind === "folder" || ((_b = (_a = node.children) == null ? void 0 : _a.length) != null ? _b : 0) > 0;
+      const hasChildren = node.kind === "folder" || ((_c = (_b = node.children) == null ? void 0 : _b.length) != null ? _c : 0) > 0;
       const isOpen = this.expanded.has(this.nodeKey(node));
       const caret = row.createSpan({ cls: ["phb-caret", ...isOpen ? ["phb-open"] : []] });
       caret.innerHTML = ICON_CHEVRON;
@@ -439,47 +1296,54 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_FOLDER;
       row.createDiv({ cls: "phb-item-title", text: node.title });
-      row.addEventListener("click", (e) => {
-        e.stopPropagation();
+      row.addEventListener("click", guard(() => {
         if (hasChildren) this.toggleNode(node);
-      });
+      }));
       if (isOpen) {
         const children = createDiv({ cls: "phb-children" });
         wrap.appendChild(children);
-        this.renderNodes(children, this.childrenOf(node));
+        this.renderNodes(children, this.childrenOf(node), map);
       }
     } else if (node.kind === "file") {
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_FILE;
       row.createDiv({ cls: "phb-item-title", text: node.title });
-      row.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.openFile(node);
-      });
+      row.addEventListener("click", guard(() => this.openFile(node)));
     } else if (node.kind === "search") {
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_SEARCH;
       row.createDiv({ cls: "phb-item-title", text: node.title });
-      row.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void this.openSearch(node);
-      });
+      row.addEventListener("click", guard(() => void this.openSearch(node)));
     } else if (node.kind === "url") {
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_LINK;
       row.createDiv({ cls: "phb-item-title", text: node.title });
-      row.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.openUrl(node);
-      });
+      row.addEventListener("click", guard(() => this.openUrl(node)));
     } else {
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_GRAPH;
       row.createDiv({ cls: "phb-item-title", text: node.title });
-      row.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void this.openGraph(node);
+      row.addEventListener("click", guard(() => void this.openGraph(node)));
+    }
+    if (raw) {
+      row.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        if (Date.now() - this.gestureState.lastTouchAt < 1e3) return;
+        this.showNodeMenu(node, raw, { x: e.clientX, y: e.clientY }, false);
       });
+      if (this.writeMode !== "none") {
+        attachRowDrag(
+          row,
+          {
+            listEl: this.listEl,
+            isBookmarkRow: (r) => this.rowItems.has(r),
+            isGroupRow: (r) => r.classList.contains("phb-item-group"),
+            onMenu: (pos) => this.showNodeMenu(node, raw, pos, true),
+            onDrop: (target) => void this.handleDrop(node, raw, target)
+          },
+          this.gestureState
+        );
+      }
     }
     return wrap;
   }
@@ -528,9 +1392,239 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     });
   }
   /* ------------------------------------------------------------------ */
+  /* Click suppression (touch long-press / drag → synthetic click)       */
+  /* (ClickSuppressor auto-resets if the flag is never consumed, so a    */
+  /* stale flag after a drag re-render cannot swallow a later click.)    */
+  /* ------------------------------------------------------------------ */
+  consumeSuppressedClick() {
+    return this.clickSuppressor.consume();
+  }
+  /* ------------------------------------------------------------------ */
+  /* Menu                                                               */
+  /* ------------------------------------------------------------------ */
+  showNodeMenu(node, raw, pos, fromTouch) {
+    var _a, _b;
+    if (fromTouch) this.clickSuppressor.setActive(true);
+    const opts = { readonly: this.writeMode === "none" };
+    if (node.kind === "group") {
+      opts.groupItemCount = countGroupItems(raw);
+      opts.expanded = this.expanded.has(this.nodeKey(node));
+      opts.canToggle = ((_b = (_a = node.children) == null ? void 0 : _a.length) != null ? _b : 0) > 0;
+    } else if (node.kind === "folder") {
+      opts.expanded = this.expanded.has(this.nodeKey(node));
+    }
+    const handlers = {
+      open: () => this.openBookmarkAction(node, false),
+      openNewTab: () => this.openBookmarkAction(node, true),
+      copy: () => this.copyBookmarkAction(node),
+      toggle: () => this.toggleNode(node),
+      rename: () => this.renameBookmark(node, raw),
+      moveToGroup: () => void this.moveBookmarkToGroup(node, raw),
+      delete: () => this.deleteBookmark(node, raw)
+    };
+    showNodeMenu(this.app, node, pos, opts, handlers, () => {
+      this.clickSuppressor.setActive(false);
+    });
+  }
+  openBookmarkAction(node, newLeaf) {
+    if (node.kind === "file") this.openFile(node, newLeaf);
+    else if (node.kind === "search") void this.openSearch(node, newLeaf);
+    else if (node.kind === "url") this.openUrl(node);
+    else if (node.kind === "graph") void this.openGraph(node, newLeaf);
+  }
+  copyBookmarkAction(node) {
+    var _a, _b, _c, _d, _e;
+    let text = "";
+    if (node.kind === "file") {
+      const vaultName = this.app.vault.getName();
+      const base = (_a = node.path) != null ? _a : "";
+      const sub = node.subpath ? "#" + node.subpath : "";
+      text = `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(base)}${sub}`;
+    } else if (node.kind === "search") {
+      text = (_d = (_c = (_b = node.query) != null ? _b : node.path) != null ? _c : node.title) != null ? _d : "";
+    } else if (node.kind === "url") {
+      text = (_e = node.url) != null ? _e : "";
+    }
+    if (text) void navigator.clipboard.writeText(text);
+  }
+  renameBookmark(node, raw) {
+    new RenameModal(this.app, node.title, (value) => {
+      void this.applyWrite(node, raw, (_data, item) => {
+        renameItemInData(item, value);
+        return true;
+      });
+    }).open();
+  }
+  deleteBookmark(node, raw) {
+    const doDelete = () => {
+      void this.applyWrite(node, raw, (data, item) => removeItemFromData(data, item));
+    };
+    if (node.kind === "group") {
+      const count = countGroupItems(raw);
+      new ConfirmModal(
+        this.app,
+        `\u5220\u9664\u5206\u7EC4\u300C${node.title}\u300D\u5C06\u540C\u65F6\u5220\u9664\u7EC4\u5185 ${count} \u4E2A\u4E66\u7B7E\uFF0C\u6B64\u64CD\u4F5C\u4E0D\u53EF\u64A4\u9500\u3002`,
+        doDelete
+      ).open();
+    } else {
+      doDelete();
+    }
+  }
+  async moveBookmarkToGroup(node, raw) {
+    const resolved = await this.resolveBookmarks();
+    if (!(resolved == null ? void 0 : resolved.data)) return;
+    const data = resolved.data;
+    const item = this.locateIn(data, raw, node);
+    if (!item) {
+      new import_obsidian2.Notice("\u4E66\u7B7E\u4E0D\u5B58\u5728\u6216\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u8BD5");
+      return;
+    }
+    const choices = [
+      { group: null, label: "\uFF08\u9876\u5C42\uFF09" },
+      ...groupChoicesFor(data, item).map((e) => ({ group: e.group, label: e.label }))
+    ];
+    new GroupPickerModal(this.app, choices, (target) => {
+      void this.applyWrite(
+        node,
+        raw,
+        (d, it) => applyMoveToGroupChoice(d, it, target, (g) => this.containerKeyOf(g))
+      );
+    }).open();
+  }
+  /* ------------------------------------------------------------------ */
+  /* Drag & drop                                                         */
+  /* ------------------------------------------------------------------ */
+  async handleDrop(node, raw, target) {
+    var _a, _b;
+    this.clickSuppressor.setActive(true);
+    if (target.kind === "none") return;
+    const resolved = await this.resolveBookmarks();
+    if (!(resolved == null ? void 0 : resolved.data)) return;
+    const data = resolved.data;
+    const dragItem = this.locateIn(data, raw, node);
+    if (!dragItem) return;
+    let targetItem = null;
+    if (target.kind === "row") {
+      const tNode = (_a = this.rowNodes.get(target.row)) != null ? _a : null;
+      const tRaw = (_b = this.rowItems.get(target.row)) != null ? _b : null;
+      targetItem = tRaw ? this.locateIn(data, tRaw, tNode) : null;
+      if (!targetItem) return;
+    }
+    const mode = target.kind === "empty" ? "top" : target.mode;
+    const action = computeDropAction(data, dragItem, targetItem, mode);
+    if (!action.ok) return;
+    await this.commitAction(resolved, data, (d) => moveItemInData(d, dragItem, action.target, action.index));
+  }
+  /* ------------------------------------------------------------------ */
+  /* Write-back                                                          */
+  /* ------------------------------------------------------------------ */
+  /**
+   * Locate a raw item in `data` by identity, then by a stable key.
+   * After a file re-read the render reference is a different object, so
+   * the key fallback hits the exact slot among duplicate same-key
+   * bookmarks via the render-time ordinal.
+   */
+  locateIn(data, obj, node) {
+    var _a;
+    const byId = locateItem(data, (it) => it === obj);
+    if (byId) return byId.item;
+    if (node) {
+      const key = this.itemKeyOf(node);
+      const byKey = locateItemAtOrdinal(data, key, (_a = this.renderOrdinals.get(node)) != null ? _a : 0);
+      if (byKey) return byKey.item;
+      const anyKey = locateItem(data, key);
+      if (anyKey) return anyKey.item;
+    }
+    return null;
+  }
+  /** Stable key predicate for a rendered node (fallback when identity is lost). */
+  itemKeyOf(node) {
+    switch (node.kind) {
+      case "file":
+        return (it) => {
+          var _a, _b;
+          return it.type === "file" && it.path === node.path && ((_a = it.subpath) != null ? _a : "") === ((_b = node.subpath) != null ? _b : "");
+        };
+      case "folder":
+        return (it) => it.type === "folder" && it.path === node.path;
+      case "search":
+        return (it) => {
+          var _a, _b;
+          return it.type === "search" && ((_a = it.query) != null ? _a : "") === ((_b = node.query) != null ? _b : "");
+        };
+      case "url":
+        return (it) => {
+          var _a, _b;
+          return it.type === "url" && ((_a = it.url) != null ? _a : "") === ((_b = node.url) != null ? _b : "");
+        };
+      case "graph":
+        return (it) => {
+          var _a, _b;
+          return it.type === "graph" && ((_a = it.title) != null ? _a : "\u56FE\u8C31") === ((_b = node.title) != null ? _b : "\u56FE\u8C31");
+        };
+      case "group":
+        if (node.id != null) return (it) => it.id === node.id;
+        return (it) => {
+          var _a, _b;
+          return it.type === "group" && ((_a = it.title) != null ? _a : "") === ((_b = node.title) != null ? _b : "");
+        };
+      default:
+        return () => false;
+    }
+  }
+  containerKeyOf(group) {
+    return (it) => {
+      var _a, _b;
+      if (!Array.isArray(it.items)) return false;
+      if (group.id != null) return it.id === group.id;
+      return ((_a = it.title) != null ? _a : "") === ((_b = group.title) != null ? _b : "");
+    };
+  }
+  /**
+   * Re-resolve the data, locate the item, run the mutation and persist
+   * via commitWrite (instance → onItemsChanged; file → backup + write +
+   * verify). Refreshes the popover on success; notices on failure.
+   */
+  async applyWrite(node, raw, op) {
+    const resolved = await this.resolveBookmarks();
+    if (!(resolved == null ? void 0 : resolved.data)) {
+      new import_obsidian2.Notice("\u65E0\u6CD5\u8BFB\u53D6\u4E66\u7B7E\u6570\u636E");
+      return;
+    }
+    const data = resolved.data;
+    const item = this.locateIn(data, raw, node);
+    if (!item) {
+      new import_obsidian2.Notice("\u4E66\u7B7E\u4E0D\u5B58\u5728\u6216\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u8BD5");
+      return;
+    }
+    await this.commitAction(resolved, data, (d) => op(d, item));
+  }
+  /** Apply a mutation against `data` and persist through commitWrite. */
+  async commitAction(resolved, data, mutate) {
+    if (resolved.mode === "none") {
+      new import_obsidian2.Notice("\u5F53\u524D\u4E3A\u53EA\u8BFB\u6A21\u5F0F\uFF0C\u65E0\u6CD5\u4FEE\u6539\u4E66\u7B7E");
+      return;
+    }
+    const source = {
+      mode: resolved.mode,
+      data,
+      instance: resolved.instance,
+      adapter: resolved.adapter,
+      filePath: BOOKMARKS_FILE
+    };
+    const result = await commitWrite(source, mutate);
+    if (result.ok) {
+      this.rerenderList();
+      return;
+    }
+    if (result.reason === "rejected") return;
+    console.error("Page Header Bookmarks: write failed", result);
+    new import_obsidian2.Notice("\u4E66\u7B7E\u5199\u56DE\u5931\u8D25\uFF0C\u5DF2\u8FD8\u539F");
+  }
+  /* ------------------------------------------------------------------ */
   /* Actions                                                             */
   /* ------------------------------------------------------------------ */
-  openFile(node) {
+  openFile(node, newLeaf = true) {
     var _a;
     const file = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
     if (!isFileLike(file)) {
@@ -538,15 +1632,15 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       return;
     }
     const linktext = ((_a = node.path) != null ? _a : "") + (node.subpath ? "#" + node.subpath : "");
-    void this.app.workspace.openLinkText(linktext, "", true);
+    void this.app.workspace.openLinkText(linktext, "", newLeaf);
     this.closePopover();
   }
-  async openSearch(node) {
+  async openSearch(node, newLeaf = false) {
     var _a, _b, _c, _d;
     try {
       const query = (_c = (_b = (_a = node.query) != null ? _a : node.path) != null ? _b : node.title) != null ? _c : "";
       const existing = this.app.workspace.getLeavesOfType("search");
-      const leaf = (_d = existing[0]) != null ? _d : this.app.workspace.getRightLeaf(false);
+      const leaf = (_d = existing[0]) != null ? _d : this.app.workspace.getRightLeaf(newLeaf);
       if (leaf) {
         await leaf.setViewState({ type: "search", state: { query } });
         this.app.workspace.revealLeaf(leaf);
@@ -569,11 +1663,11 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     }
     this.closePopover();
   }
-  async openGraph(node) {
+  async openGraph(node, newLeaf = false) {
     var _a;
     try {
       const existing = this.app.workspace.getLeavesOfType("graph");
-      const leaf = (_a = existing[0]) != null ? _a : this.app.workspace.getRightLeaf(false);
+      const leaf = (_a = existing[0]) != null ? _a : this.app.workspace.getRightLeaf(newLeaf);
       if (leaf) {
         const state = { query: "" };
         if (node.options && typeof node.options === "object") Object.assign(state, node.options);

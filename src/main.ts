@@ -1,4 +1,4 @@
-import { ItemView, Plugin, WorkspaceLeaf } from "obsidian";
+import { ItemView, Notice, Plugin, WorkspaceLeaf } from "obsidian";
 import { buildTree, isFileLike, isFolderLike } from "./tree";
 import type {
 	BookmarkGroupLike as BookmarkGroup,
@@ -7,6 +7,26 @@ import type {
 	TreeNode,
 	VaultLike,
 } from "./tree";
+import { attachRowDrag, ClickSuppressor, CLICK_SUPPRESS_RESET_MS, computeDropAction } from "./dnd";
+import type { DragGestureState, DropTarget } from "./dnd";
+import { ConfirmModal, GroupPickerModal, RenameModal, showNodeMenu } from "./menu";
+import type { GroupChoice, MenuOptions, NodeMenuHandlers } from "./menu";
+import {
+	applyMoveToGroupChoice,
+	BOOKMARKS_FILE,
+	commitWrite,
+	countGroupItems,
+	groupChoicesFor,
+	keyOrdinalOf,
+	locateItem,
+	locateItemAtOrdinal,
+	mapNodesToRaw,
+	moveItemInData,
+	parseBookmarksFile,
+	removeItemFromData,
+	renameItemInData,
+} from "./writeback";
+import type { BookmarksInstanceLike, FileAdapterLike, WriteSource } from "./writeback";
 
 /* ------------------------------------------------------------------ */
 /* Bookmark data model + tree building / dedup live in src/tree.ts      */
@@ -26,6 +46,15 @@ const ICON_GRAPH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="2
 const ICON_CHEVRON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`;
 const ICON_CLOSE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`;
 
+type WriteMode = "instance" | "file" | "none";
+
+interface ResolvedBookmarks {
+	data: BookmarksData;
+	mode: WriteMode;
+	instance: BookmarksInstanceLike | null;
+	adapter: FileAdapterLike | null;
+}
+
 export default class PageHeaderBookmarksPlugin extends Plugin {
 	/** Injected page-header buttons, keyed by the view they belong to. */
 	private buttons = new WeakMap<ItemView, HTMLElement>();
@@ -35,6 +64,28 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	private anchor: HTMLElement | null = null;
 	private listEl: HTMLElement | null = null;
 	private expanded = new Set<string>();
+
+	/** Rendered row → raw bookmark item / tree node (for menu & drag). */
+	private rowItems = new WeakMap<HTMLElement, BookmarkItem>();
+	private rowNodes = new WeakMap<HTMLElement, TreeNode>();
+
+	/**
+	 * Suppresses the click synthesized after a touch long-press / drag.
+	 * Auto-resets after CLICK_SUPPRESS_RESET_MS when never consumed — a
+	 * drag re-render may remove the row that would have consumed it, and a
+	 * stale flag must not swallow an unrelated later row click.
+	 */
+	private clickSuppressor = new ClickSuppressor(
+		CLICK_SUPPRESS_RESET_MS,
+		(fn, ms) => window.setTimeout(fn, ms),
+		(id) => window.clearTimeout(id)
+	);
+	/** Render-time same-key ordinal of each tree node (duplicate-safe re-location). */
+	private renderOrdinals = new WeakMap<TreeNode, number>();
+	/** Shared long-press timestamp (touch-synthesized contextmenu filter). */
+	private gestureState: DragGestureState = { lastTouchAt: 0 };
+	/** How the current data can be written back ("none" = read-only). */
+	private writeMode: WriteMode = "none";
 
 	private keyHandler = (e: KeyboardEvent): void => {
 		if (e.key === "Escape") this.closePopover();
@@ -177,47 +228,68 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	/* ------------------------------------------------------------------ */
 
 	/**
-	 * Fetch bookmark data from every source we know about, newest first:
+	 * Fetch bookmark data from every source we know about, newest first
+	 * (same priority as v1.0.7, plus write-back metadata):
 	 *   1. live instances (`app.bookmarks`, `app.internalPlugins…instance`)
 	 *      — the `items` tree is authoritative (it preserves group nesting),
 	 *      so prefer it over the `getBookmarks()` flat list, which may
 	 *      float group-nested items up to the top level;
 	 *   2. the core plugin's data file `.obsidian/bookmarks.json` (most
 	 *      reliable across versions; read on demand so it is always fresh).
+	 *
+	 * `mode` describes how the data can be written back:
+	 *   - "instance"  → mutate `instance.items` + onItemsChanged(true);
+	 *   - "file"      → write `.obsidian/bookmarks.json` (backup + verify);
+	 *   - "none"      → read-only (e.g. data came from a flat getBookmarks()
+	 *                   list, which cannot be written back safely).
 	 */
-	private async resolveBookmarks(): Promise<BookmarksData | null> {
-		const liveSources: unknown[] = [];
+	private async resolveBookmarks(): Promise<ResolvedBookmarks | null> {
+		const instances: BookmarksInstanceLike[] = [];
 		try {
-			liveSources.push((this.app as unknown as { bookmarks?: unknown }).bookmarks);
+			const b = (this.app as unknown as { bookmarks?: unknown }).bookmarks as
+				| BookmarksInstanceLike
+				| undefined;
+			if (b) instances.push(b);
 		} catch {
 			/* ignore */
 		}
 		try {
-			liveSources.push(
-				(
-					this.app as unknown as {
-						internalPlugins?: { plugins?: Record<string, { instance?: unknown }> };
-					}
-				).internalPlugins?.plugins?.bookmarks?.instance
-			);
+			const inst = (
+				this.app as unknown as {
+					internalPlugins?: { plugins?: Record<string, { instance?: unknown }> };
+				}
+			).internalPlugins?.plugins?.bookmarks?.instance as BookmarksInstanceLike | undefined;
+			if (inst && !instances.includes(inst)) instances.push(inst);
 		} catch {
 			/* ignore */
 		}
 
-		for (const source of liveSources) {
-			if (!source) continue;
+		let adapter: FileAdapterLike | null = null;
+		try {
+			adapter = (this.app.vault as unknown as { adapter?: FileAdapterLike }).adapter ?? null;
+		} catch {
+			/* ignore */
+		}
+
+		for (const inst of instances) {
 			try {
-				const s = source as {
-					getBookmarks?: () => BookmarkItem[];
-					items?: BookmarkItem[];
-					groups?: BookmarkGroup[];
-				};
-				const items = Array.isArray(s.items) ? s.items : [];
-				const groups = Array.isArray(s.groups) ? s.groups : [];
-				if (items.length > 0 || groups.length > 0) return { items, groups };
-				if (typeof s.getBookmarks === "function") {
-					const flat = s.getBookmarks();
-					if (Array.isArray(flat) && flat.length > 0) return { items: flat, groups: [] };
+				const items = Array.isArray(inst.items) ? inst.items : [];
+				const rawGroups = (inst as unknown as { groups?: BookmarkGroup[] }).groups;
+				const groups = Array.isArray(rawGroups) ? rawGroups : [];
+				if (items.length > 0 || groups.length > 0) {
+					return {
+						data: { items, groups },
+						mode: "instance",
+						instance: inst,
+						adapter,
+					};
+				}
+				if (typeof (inst as { getBookmarks?: () => BookmarkItem[] }).getBookmarks === "function") {
+					const flat = (inst as { getBookmarks?: () => BookmarkItem[] }).getBookmarks?.();
+					if (Array.isArray(flat) && flat.length > 0) {
+						// Flat lists cannot be written back safely → read-only.
+						return { data: { items: flat, groups: [] }, mode: "none", instance: inst, adapter };
+					}
 				}
 				// Instance exists but is empty (data may not be loaded yet) —
 				// fall through to the next source.
@@ -227,20 +299,20 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		}
 
 		// Final fallback: the core plugin's data file.
-		try {
-			const adapter = (this.app.vault as unknown as { adapter?: { read?: (p: string) => Promise<string> } }).adapter;
-			if (adapter && typeof adapter.read === "function") {
-				const raw = await adapter.read(".obsidian/bookmarks.json");
-				if (raw) {
-					const data = JSON.parse(raw) as { items?: BookmarkItem[]; groups?: BookmarkGroup[] };
-					return {
-						items: Array.isArray(data?.items) ? data.items : [],
-						groups: Array.isArray(data?.groups) ? data.groups : [],
-					};
+		if (adapter && typeof adapter.read === "function") {
+			try {
+				const raw = await adapter.read(BOOKMARKS_FILE);
+				const parsed = parseBookmarksFile(raw);
+				if (parsed) {
+					// A legal empty file ({"items":[]}) is valid data too —
+					// the UI then renders the "暂无书签" guide instead of
+					// the "未读取到书签数据" error.
+					const mode: WriteMode = typeof adapter.write === "function" ? "file" : "none";
+					return { data: parsed, mode, instance: instances[0] ?? null, adapter };
 				}
+			} catch {
+				/* file missing or unparseable */
 			}
-		} catch {
-			/* file missing or unparseable */
 		}
 
 		return null;
@@ -253,7 +325,9 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	private async renderInto(list: HTMLElement): Promise<void> {
 		list.empty();
 
-		const data = await this.resolveBookmarks();
+		const resolved = await this.resolveBookmarks();
+		const data = resolved?.data ?? null;
+		this.writeMode = resolved?.mode ?? "none";
 		if (!data) {
 			list.createDiv({
 				cls: "phb-empty",
@@ -282,7 +356,34 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			return;
 		}
 
-		this.renderNodes(list, nodes);
+		const map = mapNodesToRaw(nodes, data, this.app.vault as unknown as VaultLike);
+		this.renderOrdinals = this.computeRenderOrdinals(nodes, data, map);
+		this.renderNodes(list, nodes, map);
+	}
+
+	/**
+	 * Same-key ordinal of each rendered node in `data` (0-based, in data
+	 * DFS order). After a file-mode re-read the render reference is a
+	 * different object, so locateIn uses this ordinal to hit the exact
+	 * duplicate bookmark instead of always the first same-key match.
+	 */
+	private computeRenderOrdinals(
+		nodes: TreeNode[],
+		data: BookmarksData,
+		map: Map<TreeNode, BookmarkItem>
+	): WeakMap<TreeNode, number> {
+		const ordinals = new WeakMap<TreeNode, number>();
+		const stack = [...nodes];
+		while (stack.length > 0) {
+			const node = stack.pop() as TreeNode;
+			const raw = map.get(node);
+			if (raw) {
+				const ord = keyOrdinalOf(data, this.itemKeyOf(node), raw);
+				if (ord >= 0) ordinals.set(node, ord);
+			}
+			if (node.children) stack.push(...node.children);
+		}
+		return ordinals;
 	}
 
 	/** Stable identity for a tree node, used to keep expansion state across re-renders. */
@@ -305,13 +406,26 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		}
 	}
 
-	private renderNodes(container: HTMLElement, nodes: TreeNode[]): void {
-		for (const node of nodes) container.appendChild(this.renderNode(node));
+	private renderNodes(container: HTMLElement, nodes: TreeNode[], map: Map<TreeNode, BookmarkItem>): void {
+		for (const node of nodes) container.appendChild(this.renderNode(node, map));
 	}
 
-	private renderNode(node: TreeNode): HTMLElement {
+	private renderNode(node: TreeNode, map: Map<TreeNode, BookmarkItem>): HTMLElement {
 		const wrap = createDiv({ cls: "phb-node" });
-		const row = wrap.createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
+		const row = createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
+		const raw = map.get(node) ?? null;
+		if (raw) {
+			this.rowItems.set(row, raw);
+			this.rowNodes.set(row, node);
+		}
+
+		// Existing click behavior, unchanged, with a guard that consumes the
+		// synthetic click after a touch long-press / drag.
+		const guard = (fn: () => void) => (e: MouseEvent): void => {
+			e.stopPropagation();
+			if (this.consumeSuppressedClick()) return;
+			fn();
+		};
 
 		if (node.kind === "group" || node.kind === "folder") {
 			const hasChildren = node.kind === "folder" || (node.children?.length ?? 0) > 0;
@@ -322,47 +436,57 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_FOLDER;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
-			row.addEventListener("click", (e: MouseEvent) => {
-				e.stopPropagation();
+			row.addEventListener("click", guard(() => {
 				if (hasChildren) this.toggleNode(node);
-			});
+			}));
 			if (isOpen) {
 				const children = createDiv({ cls: "phb-children" });
 				wrap.appendChild(children);
-				this.renderNodes(children, this.childrenOf(node));
+				this.renderNodes(children, this.childrenOf(node), map);
 			}
 		} else if (node.kind === "file") {
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_FILE;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
-			row.addEventListener("click", (e: MouseEvent) => {
-				e.stopPropagation();
-				this.openFile(node);
-			});
+			row.addEventListener("click", guard(() => this.openFile(node)));
 		} else if (node.kind === "search") {
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_SEARCH;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
-			row.addEventListener("click", (e: MouseEvent) => {
-				e.stopPropagation();
-				void this.openSearch(node);
-			});
+			row.addEventListener("click", guard(() => void this.openSearch(node)));
 		} else if (node.kind === "url") {
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_LINK;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
-			row.addEventListener("click", (e: MouseEvent) => {
-				e.stopPropagation();
-				this.openUrl(node);
-			});
+			row.addEventListener("click", guard(() => this.openUrl(node)));
 		} else {
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_GRAPH;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
-			row.addEventListener("click", (e: MouseEvent) => {
-				e.stopPropagation();
-				void this.openGraph(node);
+			row.addEventListener("click", guard(() => void this.openGraph(node)));
+		}
+
+		if (raw) {
+			// Right-click menu (immediate). Touch long-press menus are raised
+			// by the drag gesture; the synthesized contextmenu is ignored.
+			row.addEventListener("contextmenu", (e: MouseEvent) => {
+				e.preventDefault();
+				if (Date.now() - this.gestureState.lastTouchAt < 1000) return;
+				this.showNodeMenu(node, raw, { x: e.clientX, y: e.clientY }, false);
 			});
+			if (this.writeMode !== "none") {
+				attachRowDrag(
+					row,
+					{
+						listEl: this.listEl as HTMLElement,
+						isBookmarkRow: (r) => this.rowItems.has(r),
+						isGroupRow: (r) => r.classList.contains("phb-item-group"),
+						onMenu: (pos) => this.showNodeMenu(node, raw, pos, true),
+						onDrop: (target) => void this.handleDrop(node, raw, target),
+					},
+					this.gestureState
+				);
+			}
 		}
 
 		return wrap;
@@ -415,10 +539,258 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	}
 
 	/* ------------------------------------------------------------------ */
+	/* Click suppression (touch long-press / drag → synthetic click)       */
+	/* (ClickSuppressor auto-resets if the flag is never consumed, so a    */
+	/* stale flag after a drag re-render cannot swallow a later click.)    */
+	/* ------------------------------------------------------------------ */
+
+	private consumeSuppressedClick(): boolean {
+		return this.clickSuppressor.consume();
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Menu                                                               */
+	/* ------------------------------------------------------------------ */
+
+	private showNodeMenu(node: TreeNode, raw: BookmarkItem, pos: { x: number; y: number }, fromTouch: boolean): void {
+		// A touch long-press synthesizes a click when the finger lifts —
+		// consume it; a right-click never produces a click.
+		if (fromTouch) this.clickSuppressor.setActive(true);
+
+		const opts: MenuOptions = { readonly: this.writeMode === "none" };
+		if (node.kind === "group") {
+			opts.groupItemCount = countGroupItems(raw);
+			opts.expanded = this.expanded.has(this.nodeKey(node));
+			opts.canToggle = (node.children?.length ?? 0) > 0;
+		} else if (node.kind === "folder") {
+			opts.expanded = this.expanded.has(this.nodeKey(node));
+		}
+
+		const handlers: NodeMenuHandlers = {
+			open: () => this.openBookmarkAction(node, false),
+			openNewTab: () => this.openBookmarkAction(node, true),
+			copy: () => this.copyBookmarkAction(node),
+			toggle: () => this.toggleNode(node),
+			rename: () => this.renameBookmark(node, raw),
+			moveToGroup: () => void this.moveBookmarkToGroup(node, raw),
+			delete: () => this.deleteBookmark(node, raw),
+		};
+		showNodeMenu(this.app, node, pos, opts, handlers, () => {
+			this.clickSuppressor.setActive(false);
+		});
+	}
+
+	private openBookmarkAction(node: TreeNode, newLeaf: boolean): void {
+		if (node.kind === "file") this.openFile(node, newLeaf);
+		else if (node.kind === "search") void this.openSearch(node, newLeaf);
+		else if (node.kind === "url") this.openUrl(node);
+		else if (node.kind === "graph") void this.openGraph(node, newLeaf);
+	}
+
+	private copyBookmarkAction(node: TreeNode): void {
+		let text = "";
+		if (node.kind === "file") {
+			const vaultName = this.app.vault.getName();
+			const base = node.path ?? "";
+			const sub = node.subpath ? "#" + node.subpath : "";
+			text = `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(base)}${sub}`;
+		} else if (node.kind === "search") {
+			text = node.query ?? node.path ?? node.title ?? "";
+		} else if (node.kind === "url") {
+			text = node.url ?? "";
+		}
+		if (text) void navigator.clipboard.writeText(text);
+	}
+
+	private renameBookmark(node: TreeNode, raw: BookmarkItem): void {
+		new RenameModal(this.app, node.title, (value) => {
+			void this.applyWrite(node, raw, (_data, item) => {
+				renameItemInData(item, value);
+				return true;
+			});
+		}).open();
+	}
+
+	private deleteBookmark(node: TreeNode, raw: BookmarkItem): void {
+		const doDelete = (): void => {
+			void this.applyWrite(node, raw, (data, item) => removeItemFromData(data, item));
+		};
+		if (node.kind === "group") {
+			const count = countGroupItems(raw);
+			new ConfirmModal(
+				this.app,
+				`删除分组「${node.title}」将同时删除组内 ${count} 个书签，此操作不可撤销。`,
+				doDelete
+			).open();
+		} else {
+			doDelete();
+		}
+	}
+
+	private async moveBookmarkToGroup(node: TreeNode, raw: BookmarkItem): Promise<void> {
+		const resolved = await this.resolveBookmarks();
+		if (!resolved?.data) return;
+		const data = resolved.data;
+		const item = this.locateIn(data, raw, node);
+		if (!item) {
+			new Notice("书签不存在或已变化，请重试");
+			return;
+		}
+		const choices: GroupChoice[] = [
+			{ group: null, label: "（顶层）" },
+			...groupChoicesFor(data, item).map((e) => ({ group: e.group, label: e.label })),
+		];
+		new GroupPickerModal(this.app, choices, (target) => {
+			// target === null = "（顶层）" → move to the root list (append).
+			// (FuzzySuggestModal only calls onChooseItem on a real selection,
+			// so null can only mean the top-level option.)
+			void this.applyWrite(node, raw, (d, it) =>
+				applyMoveToGroupChoice(d, it, target, (g) => this.containerKeyOf(g))
+			);
+		}).open();
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Drag & drop                                                         */
+	/* ------------------------------------------------------------------ */
+
+	private async handleDrop(node: TreeNode, raw: BookmarkItem, target: DropTarget): Promise<void> {
+		// The drop synthesizes a click; suppress it. The suppressor
+		// auto-resets if the re-render removed the row that would have
+		// consumed it, so the next row click is not swallowed.
+		this.clickSuppressor.setActive(true);
+		if (target.kind === "none") return;
+		const resolved = await this.resolveBookmarks();
+		if (!resolved?.data) return;
+		const data = resolved.data;
+
+		const dragItem = this.locateIn(data, raw, node);
+		if (!dragItem) return; // stale row (data changed) → no-op
+
+		let targetItem: BookmarkItem | null = null;
+		if (target.kind === "row") {
+			const tNode = this.rowNodes.get(target.row) ?? null;
+			const tRaw = this.rowItems.get(target.row) ?? null;
+			targetItem = tRaw ? this.locateIn(data, tRaw, tNode) : null;
+			if (!targetItem) return;
+		}
+
+		const mode = target.kind === "empty" ? "top" : target.mode;
+		const action = computeDropAction(data, dragItem, targetItem, mode);
+		if (!action.ok) return;
+
+		await this.commitAction(resolved, data, (d) => moveItemInData(d, dragItem, action.target, action.index));
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Write-back                                                          */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Locate a raw item in `data` by identity, then by a stable key.
+	 * After a file re-read the render reference is a different object, so
+	 * the key fallback hits the exact slot among duplicate same-key
+	 * bookmarks via the render-time ordinal.
+	 */
+	private locateIn(data: BookmarksData, obj: BookmarkItem, node: TreeNode | null): BookmarkItem | null {
+		const byId = locateItem(data, (it) => it === obj);
+		if (byId) return byId.item;
+		if (node) {
+			const key = this.itemKeyOf(node);
+			const byKey = locateItemAtOrdinal(data, key, this.renderOrdinals.get(node) ?? 0);
+			if (byKey) return byKey.item;
+			// Data changed since render → the ordinal may no longer hold;
+			// fall back to any same-key match.
+			const anyKey = locateItem(data, key);
+			if (anyKey) return anyKey.item;
+		}
+		return null;
+	}
+
+	/** Stable key predicate for a rendered node (fallback when identity is lost). */
+	private itemKeyOf(node: TreeNode): (it: BookmarkItem) => boolean {
+		switch (node.kind) {
+			case "file":
+				return (it) =>
+					it.type === "file" &&
+					it.path === node.path &&
+					(it.subpath ?? "") === (node.subpath ?? "");
+			case "folder":
+				return (it) => it.type === "folder" && it.path === node.path;
+			case "search":
+				return (it) => it.type === "search" && (it.query ?? "") === (node.query ?? "");
+			case "url":
+				return (it) => it.type === "url" && (it.url ?? "") === (node.url ?? "");
+			case "graph":
+				return (it) => it.type === "graph" && (it.title ?? "图谱") === (node.title ?? "图谱");
+			case "group":
+				if (node.id != null) return (it) => (it as { id?: string }).id === node.id;
+				return (it) => it.type === "group" && (it.title ?? "") === (node.title ?? "");
+			default:
+				return () => false;
+		}
+	}
+
+	private containerKeyOf(group: BookmarkItem): (it: BookmarkItem) => boolean {
+		return (it) => {
+			if (!Array.isArray((it as { items?: unknown }).items)) return false;
+			if (group.id != null) return (it as { id?: string }).id === group.id;
+			return (it.title ?? "") === (group.title ?? "");
+		};
+	}
+
+	/**
+	 * Re-resolve the data, locate the item, run the mutation and persist
+	 * via commitWrite (instance → onItemsChanged; file → backup + write +
+	 * verify). Refreshes the popover on success; notices on failure.
+	 */
+	private async applyWrite(
+		node: TreeNode,
+		raw: BookmarkItem,
+		op: (data: BookmarksData, item: BookmarkItem) => boolean
+	): Promise<void> {
+		const resolved = await this.resolveBookmarks();
+		if (!resolved?.data) {
+			new Notice("无法读取书签数据");
+			return;
+		}
+		const data = resolved.data;
+		const item = this.locateIn(data, raw, node);
+		if (!item) {
+			new Notice("书签不存在或已变化，请重试");
+			return;
+		}
+		await this.commitAction(resolved, data, (d) => op(d, item));
+	}
+
+	/** Apply a mutation against `data` and persist through commitWrite. */
+	private async commitAction(resolved: ResolvedBookmarks, data: BookmarksData, mutate: (d: BookmarksData) => boolean): Promise<void> {
+		if (resolved.mode === "none") {
+			new Notice("当前为只读模式，无法修改书签");
+			return;
+		}
+		const source: WriteSource = {
+			mode: resolved.mode,
+			data,
+			instance: resolved.instance,
+			adapter: resolved.adapter,
+			filePath: BOOKMARKS_FILE,
+		};
+		const result = await commitWrite(source, mutate);
+		if (result.ok) {
+			this.rerenderList();
+			return;
+		}
+		if (result.reason === "rejected") return; // silent no-op
+		console.error("Page Header Bookmarks: write failed", result);
+		new Notice("书签写回失败，已还原");
+	}
+
+	/* ------------------------------------------------------------------ */
 	/* Actions                                                             */
 	/* ------------------------------------------------------------------ */
 
-	private openFile(node: TreeNode): void {
+	private openFile(node: TreeNode, newLeaf = true): void {
 		const file = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
 		if (!isFileLike(file)) {
 			// Deleted between render and click — still close per the close rule.
@@ -426,15 +798,15 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			return;
 		}
 		const linktext = (node.path ?? "") + (node.subpath ? "#" + node.subpath : "");
-		void this.app.workspace.openLinkText(linktext, "", true);
+		void this.app.workspace.openLinkText(linktext, "", newLeaf);
 		this.closePopover();
 	}
 
-	private async openSearch(node: TreeNode): Promise<void> {
+	private async openSearch(node: TreeNode, newLeaf = false): Promise<void> {
 		try {
 			const query = node.query ?? node.path ?? node.title ?? "";
 			const existing = this.app.workspace.getLeavesOfType("search");
-			const leaf: WorkspaceLeaf | null = existing[0] ?? this.app.workspace.getRightLeaf(false);
+			const leaf: WorkspaceLeaf | null = existing[0] ?? this.app.workspace.getRightLeaf(newLeaf);
 			if (leaf) {
 				await leaf.setViewState({ type: "search", state: { query } });
 				this.app.workspace.revealLeaf(leaf);
@@ -458,10 +830,10 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		this.closePopover();
 	}
 
-	private async openGraph(node: TreeNode): Promise<void> {
+	private async openGraph(node: TreeNode, newLeaf = false): Promise<void> {
 		try {
 			const existing = this.app.workspace.getLeavesOfType("graph");
-			const leaf: WorkspaceLeaf | null = existing[0] ?? this.app.workspace.getRightLeaf(false);
+			const leaf: WorkspaceLeaf | null = existing[0] ?? this.app.workspace.getRightLeaf(newLeaf);
 			if (leaf) {
 				const state: Record<string, unknown> = { query: "" };
 				if (node.options && typeof node.options === "object") Object.assign(state, node.options);
