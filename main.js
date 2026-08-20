@@ -259,6 +259,10 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     const covered = this.computeCoveredPaths(data);
     const convert = (it) => {
       if (!it) return null;
+      if (it.type === "group") {
+        const kids = (Array.isArray(it.items) ? it.items : []).map(convert).filter((n) => n !== null);
+        return { kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids };
+      }
       if ((it.type === "file" || it.type === "folder") && it.path && covered.has(normalizePath(it.path))) {
         return null;
       }
@@ -266,13 +270,8 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     };
     const root = [];
     for (const it of data.items) {
-      if ((it == null ? void 0 : it.type) === "group") {
-        const kids = (Array.isArray(it.items) ? it.items : []).map(convert).filter((n) => n !== null);
-        root.push({ kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
-      } else {
-        const n = convert(it);
-        if (n) root.push(n);
-      }
+      const n = convert(it);
+      if (n) root.push(n);
     }
     for (const g of data.groups) {
       const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map(convert).filter((n) => n !== null);

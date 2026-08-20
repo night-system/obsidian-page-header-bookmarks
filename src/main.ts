@@ -340,6 +340,13 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 
 		const convert = (it: BookmarkItem | undefined): TreeNode | null => {
 			if (!it) return null;
+			if (it.type === "group") {
+				// Nested groups are supported by the core bookmarks UI.
+				const kids = (Array.isArray(it.items) ? it.items : [])
+					.map(convert)
+					.filter((n): n is TreeNode => n !== null);
+				return { kind: "group", title: it.title || "未命名分组", children: kids };
+			}
 			if (
 				(it.type === "file" || it.type === "folder") &&
 				it.path &&
@@ -352,15 +359,8 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 
 		const root: TreeNode[] = [];
 		for (const it of data.items) {
-			if (it?.type === "group") {
-				const kids = (Array.isArray(it.items) ? it.items : [])
-					.map(convert)
-					.filter((n): n is TreeNode => n !== null);
-				root.push({ kind: "group", title: it.title || "未命名分组", children: kids });
-			} else {
-				const n = convert(it);
-				if (n) root.push(n);
-			}
+			const n = convert(it);
+			if (n) root.push(n);
 		}
 		for (const g of data.groups) {
 			const kids = (g?.items ?? [])
