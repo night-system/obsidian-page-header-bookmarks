@@ -1,7 +1,7 @@
 {
 	"id": "page-header-bookmarks",
 	"name": "Page Header Bookmarks",
-	"version": "1.0.4",
+	"version": "1.0.5",
 	"minAppVersion": "1.5.0",
 	"description": "Adds a bookmark icon to the page header (as defined by the Commander plugin); clicking it opens a popover with your core Bookmarks.",
 	"author": "night-system",

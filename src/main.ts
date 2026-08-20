@@ -31,6 +31,11 @@ interface BookmarksData {
 	groups: BookmarkGroup[];
 }
 
+/** Strip leading/trailing slashes so bookmark paths resolve reliably. */
+function normalizePath(p: string): string {
+	return p.replace(/^\/+|\/+$/g, "");
+}
+
 /* ------------------------------------------------------------------ */
 /* Icons (Lucide-style inline SVGs)                                    */
 /* ------------------------------------------------------------------ */
@@ -248,13 +253,15 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 					items?: BookmarkItem[];
 					groups?: BookmarkGroup[];
 				};
+				// Prefer the canonical `items` tree over the flattened
+				// getBookmarks() list (which may duplicate group children).
+				const items = Array.isArray(s.items) ? s.items : [];
+				const groups = Array.isArray(s.groups) ? s.groups : [];
+				if (items.length > 0 || groups.length > 0) return { items, groups };
 				if (typeof s.getBookmarks === "function") {
 					const flat = s.getBookmarks();
 					if (Array.isArray(flat) && flat.length > 0) return { items: flat, groups: [] };
 				}
-				const items = Array.isArray(s.items) ? s.items : [];
-				const groups = Array.isArray(s.groups) ? s.groups : [];
-				if (items.length > 0 || groups.length > 0) return { items, groups };
 				// Instance exists but is empty (data may not be loaded yet) —
 				// fall through to the next source.
 			} catch {
@@ -290,6 +297,10 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		list.empty();
 
 		const data = await this.resolveBookmarks();
+		console.debug(
+			"Page Header Bookmarks: bookmark data resolved",
+			data ? { items: data.items.length, groups: data.groups.length } : null
+		);
 		if (!data) {
 			list.createDiv({
 				cls: "phb-empty",
@@ -329,7 +340,11 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 
 		const convert = (it: BookmarkItem | undefined): TreeNode | null => {
 			if (!it) return null;
-			if ((it.type === "file" || it.type === "folder") && it.path && covered.has(it.path)) {
+			if (
+				(it.type === "file" || it.type === "folder") &&
+				it.path &&
+				covered.has(normalizePath(it.path))
+			) {
 				return null;
 			}
 			return this.itemToNode(it);
@@ -353,6 +368,17 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 				.filter((n): n is TreeNode => n !== null);
 			root.push({ kind: "group", id: g?.id, title: g?.title || "未命名分组", children: kids });
 		}
+
+		// Real data can duplicate a target both inside a group and as a
+		// standalone item; the standalone copy is only visible after removing
+		// the one that is already reachable by expanding the group.
+		this.dropRootDuplicatesOfGroupItems(root);
+		console.debug("Page Header Bookmarks: tree built", {
+			items: data.items.length,
+			groups: data.groups.length,
+			coveredByFolders: covered.size,
+			nodes: root.length,
+		});
 		return root;
 	}
 
@@ -365,7 +391,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		const folderPaths = new Set<string>();
 		const collect = (it: BookmarkItem | undefined): void => {
 			if (!it) return;
-			if (it.type === "folder" && it.path) folderPaths.add(it.path);
+			if (it.type === "folder" && it.path) folderPaths.add(normalizePath(it.path));
 			(it.items ?? []).forEach(collect);
 		};
 		data.items.forEach(collect);
@@ -392,7 +418,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		if (!it) return null;
 		const type = it.type;
 		if (type === "file") {
-			const path = it.path ?? "";
+			const path = normalizePath(it.path ?? "");
 			const file = this.app.vault.getAbstractFileByPath(path);
 			// Deleted files are hidden, same as the core bookmarks view.
 			if (!(file instanceof TFile)) return null;
@@ -400,7 +426,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			return { kind: "file", title, path, subpath: it.subpath };
 		}
 		if (type === "folder") {
-			const path = it.path ?? "";
+			const path = normalizePath(it.path ?? "");
 			const folder = this.app.vault.getAbstractFileByPath(path);
 			if (!(folder instanceof TFolder)) return null;
 			const title = it.title && it.title.trim() ? it.title : folder.name;
@@ -436,6 +462,55 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 				return `group:${node.id ?? node.title}`;
 			default:
 				return "";
+		}
+	}
+
+	/** Exact bookmark target key (type + target fields) for duplicate detection. */
+	private targetKey(n: TreeNode): string {
+		switch (n.kind) {
+			case "file":
+				return `file:${n.path ?? ""}#${n.subpath ?? ""}`;
+			case "folder":
+				return `folder:${n.path ?? ""}`;
+			case "search":
+				return `search:${n.query ?? n.path ?? ""}`;
+			case "url":
+				return `url:${n.url ?? ""}`;
+			case "graph":
+				return `graph:${n.title ?? ""}`;
+			default:
+				return "";
+		}
+	}
+
+	/**
+	 * Real bookmark data can contain the same target both inside a group and
+	 * as a standalone top-level item (e.g. a folder that is represented by a
+	 * group bookmark). The standalone copy is a duplicate of something already
+	 * visible when the group is expanded, so drop it. Matching is by exact
+	 * target key only — never by basename or path prefix — to avoid hiding
+	 * legitimately separate bookmarks (e.g. same-named files elsewhere).
+	 */
+	private dropRootDuplicatesOfGroupItems(root: TreeNode[]): void {
+		const inGroups = new Set<string>();
+		const collectChildren = (nodes: TreeNode[]): void => {
+			for (const n of nodes) {
+				if (n.kind === "group") collectChildren(n.children ?? []);
+				else inGroups.add(this.targetKey(n));
+			}
+		};
+		const collectGroups = (nodes: TreeNode[]): void => {
+			for (const n of nodes) {
+				if (n.kind === "group") {
+					collectChildren(n.children ?? []);
+					collectGroups(n.children ?? []);
+				}
+			}
+		};
+		collectGroups(root);
+		for (let i = root.length - 1; i >= 0; i--) {
+			const n = root[i];
+			if (n.kind !== "group" && inGroups.has(this.targetKey(n))) root.splice(i, 1);
 		}
 	}
 

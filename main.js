@@ -28,6 +28,9 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
+function normalizePath(p) {
+  return p.replace(/^\/+|\/+$/g, "");
+}
 var ICON_FOLDER = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`;
 var ICON_FILE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>`;
 var ICON_SEARCH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>`;
@@ -190,13 +193,13 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       if (!source) continue;
       try {
         const s = source;
+        const items = Array.isArray(s.items) ? s.items : [];
+        const groups = Array.isArray(s.groups) ? s.groups : [];
+        if (items.length > 0 || groups.length > 0) return { items, groups };
         if (typeof s.getBookmarks === "function") {
           const flat = s.getBookmarks();
           if (Array.isArray(flat) && flat.length > 0) return { items: flat, groups: [] };
         }
-        const items = Array.isArray(s.items) ? s.items : [];
-        const groups = Array.isArray(s.groups) ? s.groups : [];
-        if (items.length > 0 || groups.length > 0) return { items, groups };
       } catch (e) {
       }
     }
@@ -222,6 +225,10 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   async renderInto(list) {
     list.empty();
     const data = await this.resolveBookmarks();
+    console.debug(
+      "Page Header Bookmarks: bookmark data resolved",
+      data ? { items: data.items.length, groups: data.groups.length } : null
+    );
     if (!data) {
       list.createDiv({
         cls: "phb-empty",
@@ -252,7 +259,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     const covered = this.computeCoveredPaths(data);
     const convert = (it) => {
       if (!it) return null;
-      if ((it.type === "file" || it.type === "folder") && it.path && covered.has(it.path)) {
+      if ((it.type === "file" || it.type === "folder") && it.path && covered.has(normalizePath(it.path))) {
         return null;
       }
       return this.itemToNode(it);
@@ -271,6 +278,13 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map(convert).filter((n) => n !== null);
       root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
     }
+    this.dropRootDuplicatesOfGroupItems(root);
+    console.debug("Page Header Bookmarks: tree built", {
+      items: data.items.length,
+      groups: data.groups.length,
+      coveredByFolders: covered.size,
+      nodes: root.length
+    });
     return root;
   }
   /**
@@ -284,7 +298,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     const collect = (it) => {
       var _a2;
       if (!it) return;
-      if (it.type === "folder" && it.path) folderPaths.add(it.path);
+      if (it.type === "folder" && it.path) folderPaths.add(normalizePath(it.path));
       ((_a2 = it.items) != null ? _a2 : []).forEach(collect);
     };
     data.items.forEach(collect);
@@ -310,14 +324,14 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     if (!it) return null;
     const type = it.type;
     if (type === "file") {
-      const path = (_a = it.path) != null ? _a : "";
+      const path = normalizePath((_a = it.path) != null ? _a : "");
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof import_obsidian.TFile)) return null;
       const title = it.title && it.title.trim() ? it.title : file.basename;
       return { kind: "file", title, path, subpath: it.subpath };
     }
     if (type === "folder") {
-      const path = (_b = it.path) != null ? _b : "";
+      const path = normalizePath((_b = it.path) != null ? _b : "");
       const folder = this.app.vault.getAbstractFileByPath(path);
       if (!(folder instanceof import_obsidian.TFolder)) return null;
       const title = it.title && it.title.trim() ? it.title : folder.name;
@@ -353,6 +367,56 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
         return `group:${(_i = node.id) != null ? _i : node.title}`;
       default:
         return "";
+    }
+  }
+  /** Exact bookmark target key (type + target fields) for duplicate detection. */
+  targetKey(n) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    switch (n.kind) {
+      case "file":
+        return `file:${(_a = n.path) != null ? _a : ""}#${(_b = n.subpath) != null ? _b : ""}`;
+      case "folder":
+        return `folder:${(_c = n.path) != null ? _c : ""}`;
+      case "search":
+        return `search:${(_e = (_d = n.query) != null ? _d : n.path) != null ? _e : ""}`;
+      case "url":
+        return `url:${(_f = n.url) != null ? _f : ""}`;
+      case "graph":
+        return `graph:${(_g = n.title) != null ? _g : ""}`;
+      default:
+        return "";
+    }
+  }
+  /**
+   * Real bookmark data can contain the same target both inside a group and
+   * as a standalone top-level item (e.g. a folder that is represented by a
+   * group bookmark). The standalone copy is a duplicate of something already
+   * visible when the group is expanded, so drop it. Matching is by exact
+   * target key only — never by basename or path prefix — to avoid hiding
+   * legitimately separate bookmarks (e.g. same-named files elsewhere).
+   */
+  dropRootDuplicatesOfGroupItems(root) {
+    const inGroups = /* @__PURE__ */ new Set();
+    const collectChildren = (nodes) => {
+      var _a;
+      for (const n of nodes) {
+        if (n.kind === "group") collectChildren((_a = n.children) != null ? _a : []);
+        else inGroups.add(this.targetKey(n));
+      }
+    };
+    const collectGroups = (nodes) => {
+      var _a, _b;
+      for (const n of nodes) {
+        if (n.kind === "group") {
+          collectChildren((_a = n.children) != null ? _a : []);
+          collectGroups((_b = n.children) != null ? _b : []);
+        }
+      }
+    };
+    collectGroups(root);
+    for (let i = root.length - 1; i >= 0; i--) {
+      const n = root[i];
+      if (n.kind !== "group" && inGroups.has(this.targetKey(n))) root.splice(i, 1);
     }
   }
   renderNodes(container, nodes) {
