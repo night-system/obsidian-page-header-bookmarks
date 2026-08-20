@@ -1,16 +1,22 @@
-import { Plugin, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import { ItemView, Plugin, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 
 /* ------------------------------------------------------------------ */
-/* Internal core-plugin "Bookmarks" API (not part of the public API)   */
+/* Core-plugin "Bookmarks" data model (internal, based on decompiled    */
+/* types from obsidian-typings for Obsidian 1.13.x).                    */
 /* ------------------------------------------------------------------ */
 
 interface BookmarkItem {
-	type?: "file" | "folder" | "group" | "search";
+	type?: "file" | "folder" | "group" | "search" | "url" | "graph";
 	title?: string;
 	path?: string;
 	subpath?: string;
-	/** Search bookmarks store their query in this field (core plugin schema). */
+	/** Search bookmarks store their query here. */
 	query?: string;
+	/** URL bookmarks store the URL here. */
+	url?: string;
+	/** Graph bookmarks store the saved graph view options here. */
+	options?: unknown;
+	/** Group bookmarks nest their children here. */
 	items?: BookmarkItem[];
 }
 
@@ -20,19 +26,20 @@ interface BookmarkGroup {
 	items?: BookmarkItem[];
 }
 
-interface BookmarksAPI {
-	items?: BookmarkItem[];
-	groups?: BookmarkGroup[];
+interface BookmarksData {
+	items: BookmarkItem[];
+	groups: BookmarkGroup[];
 }
 
 /* ------------------------------------------------------------------ */
 /* Icons (Lucide-style inline SVGs)                                    */
 /* ------------------------------------------------------------------ */
 
-const ICON_BOOKMARK = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/></svg>`;
 const ICON_FOLDER = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`;
 const ICON_FILE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>`;
 const ICON_SEARCH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>`;
+const ICON_LINK = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
+const ICON_GRAPH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>`;
 const ICON_CHEVRON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`;
 const ICON_CLOSE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`;
 
@@ -40,16 +47,16 @@ const ICON_CLOSE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="2
 /* Tree model                                                          */
 /* ------------------------------------------------------------------ */
 
-type NodeKind = "group" | "folder" | "file" | "search";
+type NodeKind = "group" | "folder" | "file" | "search" | "url" | "graph";
 
 interface TreeNode {
 	kind: NodeKind;
 	title: string;
 	path?: string;
 	subpath?: string;
-	/** Search bookmarks: the search query. */
 	query?: string;
-	/** Groups: stable id when the core plugin provides one. */
+	url?: string;
+	options?: unknown;
 	id?: string;
 	/** The underlying file no longer exists. */
 	missing?: boolean;
@@ -58,8 +65,8 @@ interface TreeNode {
 }
 
 export default class PageHeaderBookmarksPlugin extends Plugin {
-	private observer: MutationObserver | null = null;
-	private syncQueued = false;
+	/** Injected page-header buttons, keyed by the view they belong to. */
+	private buttons = new WeakMap<ItemView, HTMLElement>();
 
 	private backdrop: HTMLElement | null = null;
 	private popover: HTMLElement | null = null;
@@ -77,62 +84,56 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	};
 
 	async onload(): Promise<void> {
-		this.app.workspace.onLayoutReady(() => this.syncHeaders());
+		this.app.workspace.onLayoutReady(() =>
+			window.setTimeout(() => this.addButtonsToAllLeaves(), 100)
+		);
 
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
-				this.syncHeaders();
+				this.addButtonsToAllLeaves();
 				// The pane holding the popover's anchor button is gone.
 				if (this.popover && this.anchor && !this.anchor.isConnected) this.closePopover();
 			})
 		);
 
-		this.observer = new MutationObserver(() => this.queueSync());
-		this.observer.observe(this.app.workspace.containerEl, { childList: true, subtree: true });
-
 		this.register(() => {
-			this.observer?.disconnect();
 			this.closePopover();
-			// Remove injected page-header buttons so a disabled plugin leaves no residue.
-			this.app.workspace.containerEl
-				.querySelectorAll<HTMLElement>(".phb-button")
-				.forEach((btn) => btn.remove());
+			this.removeButtonsFromAllLeaves();
 		});
 	}
 
 	/* ------------------------------------------------------------------ */
-	/* Page header button ("page header" as defined by the Commander      */
-	/* plugin: the title bar at the top of each pane, i.e. .view-header)  */
+	/* Page header button — same mechanism as the Commander plugin:        */
+	/* ItemView.addAction() (native icon rendering + native button shape), */
+	/* ordered left of the "more options" button via CSS `order`.          */
 	/* ------------------------------------------------------------------ */
 
-	private queueSync(): void {
-		if (this.syncQueued) return;
-		this.syncQueued = true;
-		requestAnimationFrame(() => {
-			this.syncQueued = false;
-			this.syncHeaders();
-		});
+	private addButtonsToAllLeaves(): void {
+		window.requestAnimationFrame(() =>
+			this.app.workspace.iterateAllLeaves((leaf) => this.addButtonToLeaf(leaf))
+		);
 	}
 
-	private syncHeaders(): void {
-		const root = this.app.workspace.containerEl;
-		root.querySelectorAll<HTMLElement>(".view-header").forEach((header) => {
-			if (header.querySelector(".phb-button")) return;
-			const btn = header.createEl("button", {
-				cls: "phb-button clickable-icon view-action",
-				attr: { "aria-label": "书签" },
-			});
-			btn.innerHTML = ICON_BOOKMARK;
-			const right = header.querySelector<HTMLElement>(".view-header-right");
-			const actions = header.querySelector<HTMLElement>(".view-actions");
-			if (right && actions) right.insertBefore(btn, actions);
-			else if (right) right.appendChild(btn);
-			else header.appendChild(btn);
-			btn.addEventListener("click", (e: MouseEvent) => {
-				e.preventDefault();
-				e.stopPropagation();
-				this.togglePopover(btn);
-			});
+	private addButtonToLeaf(leaf: WorkspaceLeaf): void {
+		const view = leaf.view;
+		if (!(view instanceof ItemView)) return;
+		if (this.buttons.has(view)) return;
+		const button = view.addAction("bookmark", "书签", () => {
+			this.togglePopover(button);
+		});
+		button.addClass("phb-button");
+		this.buttons.set(view, button);
+	}
+
+	private removeButtonsFromAllLeaves(): void {
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			const view = leaf.view;
+			if (!(view instanceof ItemView)) return;
+			const button = this.buttons.get(view);
+			if (button) {
+				button.detach();
+				this.buttons.delete(view);
+			}
 		});
 	}
 
@@ -172,7 +173,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 
 		this.listEl = popover.createDiv({ cls: "phb-popover-list" });
 		this.expanded.clear();
-		this.renderInto(this.listEl);
+		void this.renderInto(this.listEl).finally(() => this.positionPopover());
 
 		backdrop.addEventListener("click", () => this.closePopover());
 		window.addEventListener("keydown", this.keyHandler);
@@ -210,31 +211,107 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	}
 
 	/* ------------------------------------------------------------------ */
+	/* Data resolution                                                     */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Fetch bookmark data from every source we know about, newest first:
+	 *   1. live instances (`app.bookmarks`, `app.internalPlugins…instance`)
+	 *      — items may be ungrouped (old shape) or a unified list that also
+	 *      contains `type: "group"` entries with nested items (new shape);
+	 *   2. `getBookmarks()` flat list when the instance exposes it;
+	 *   3. the core plugin's data file `.obsidian/bookmarks.json` (most
+	 *      reliable across versions; read on demand so it is always fresh).
+	 */
+	private async resolveBookmarks(): Promise<BookmarksData | null> {
+		const liveSources: unknown[] = [];
+		try {
+			liveSources.push((this.app as unknown as { bookmarks?: unknown }).bookmarks);
+		} catch {
+			/* ignore */
+		}
+		try {
+			liveSources.push(
+				(
+					this.app as unknown as {
+						internalPlugins?: { plugins?: Record<string, { instance?: unknown }> };
+					}
+				).internalPlugins?.plugins?.bookmarks?.instance
+			);
+		} catch {
+			/* ignore */
+		}
+
+		for (const source of liveSources) {
+			if (!source) continue;
+			try {
+				const s = source as {
+					getBookmarks?: () => BookmarkItem[];
+					items?: BookmarkItem[];
+					groups?: BookmarkGroup[];
+				};
+				if (typeof s.getBookmarks === "function") {
+					const flat = s.getBookmarks();
+					if (Array.isArray(flat) && flat.length > 0) return { items: flat, groups: [] };
+				}
+				const items = Array.isArray(s.items) ? s.items : [];
+				const groups = Array.isArray(s.groups) ? s.groups : [];
+				if (items.length > 0 || groups.length > 0) return { items, groups };
+				// Instance exists but is empty (data may not be loaded yet) —
+				// fall through to the next source.
+			} catch {
+				/* ignore */
+			}
+		}
+
+		// Final fallback: the core plugin's data file.
+		try {
+			const adapter = (this.app.vault as unknown as { adapter?: { read?: (p: string) => Promise<string> } }).adapter;
+			if (adapter && typeof adapter.read === "function") {
+				const raw = await adapter.read(".obsidian/bookmarks.json");
+				if (raw) {
+					const data = JSON.parse(raw) as { items?: BookmarkItem[]; groups?: BookmarkGroup[] };
+					return {
+						items: Array.isArray(data?.items) ? data.items : [],
+						groups: Array.isArray(data?.groups) ? data.groups : [],
+					};
+				}
+			}
+		} catch {
+			/* file missing or unparseable */
+		}
+
+		return null;
+	}
+
+	/* ------------------------------------------------------------------ */
 	/* Rendering                                                           */
 	/* ------------------------------------------------------------------ */
 
-	private renderInto(list: HTMLElement): void {
+	private async renderInto(list: HTMLElement): Promise<void> {
 		list.empty();
 
-		const bookmarksInternal = (
-			this.app as unknown as {
-				internalPlugins?: { plugins?: Record<string, { enabled?: boolean; enable?: () => Promise<void> }> };
-			}
-		).internalPlugins?.plugins?.bookmarks;
-		if (!bookmarksInternal?.enabled) {
-			list.createDiv({ cls: "phb-empty", text: "核心插件「书签」未启用" });
+		const data = await this.resolveBookmarks();
+		if (!data) {
+			list.createDiv({
+				cls: "phb-empty",
+				text: "未读取到书签数据（请确认核心插件「书签」已启用）",
+			});
 			const enableBtn = list.createEl("button", { cls: "phb-enable", text: "启用书签插件" });
 			enableBtn.addEventListener("click", () => {
-				void bookmarksInternal?.enable?.();
+				void (
+					this.app as unknown as {
+						internalPlugins?: { plugins?: Record<string, { enable?: () => Promise<void> }> };
+					}
+				).internalPlugins?.plugins?.bookmarks?.enable?.();
 				window.setTimeout(() => {
-					this.renderInto(list);
-					this.positionPopover();
-				}, 150);
+					void this.renderInto(list).then(() => this.positionPopover());
+				}, 200);
 			});
 			return;
 		}
 
-		const nodes = this.buildTree();
+		const nodes = this.buildTree(data);
 		if (nodes.length === 0) {
 			list.createDiv({
 				cls: "phb-empty",
@@ -246,15 +323,10 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		this.renderNodes(list, nodes);
 	}
 
-	private buildTree(): TreeNode[] {
-		const bm = (this.app as unknown as { bookmarks?: BookmarksAPI }).bookmarks;
+	private buildTree(data: BookmarksData): TreeNode[] {
 		const root: TreeNode[] = [];
-		if (!bm) return root;
 
-		const items: BookmarkItem[] = Array.isArray(bm.items) ? bm.items : [];
-		const groups: BookmarkGroup[] = Array.isArray(bm.groups) ? bm.groups : [];
-
-		for (const it of items) {
+		for (const it of data.items) {
 			if (it?.type === "group" && Array.isArray(it.items) && it.items.length > 0) {
 				const kids = it.items
 					.map((x) => this.itemToNode(x))
@@ -265,7 +337,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 				if (n) root.push(n);
 			}
 		}
-		for (const g of groups) {
+		for (const g of data.groups) {
 			const kids = (g?.items ?? [])
 				.map((x) => this.itemToNode(x))
 				.filter((n): n is TreeNode => n !== null);
@@ -290,6 +362,12 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			const query = it.query ?? it.path ?? "";
 			return { kind: "search", title: it.title || query || "搜索", query, path: it.path ?? "" };
 		}
+		if (type === "url") {
+			return { kind: "url", title: it.title || it.url || "链接", url: it.url ?? "" };
+		}
+		if (type === "graph") {
+			return { kind: "graph", title: it.title || "图谱", options: it.options };
+		}
 		return null;
 	}
 
@@ -302,6 +380,10 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 				return `folder:${node.path ?? ""}`;
 			case "search":
 				return `search:${node.query ?? node.path ?? node.title ?? ""}`;
+			case "url":
+				return `url:${node.url ?? node.title ?? ""}`;
+			case "graph":
+				return `graph:${node.title ?? ""}`;
 			case "group":
 				return `group:${node.id ?? node.title}`;
 			default:
@@ -342,13 +424,29 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 				e.stopPropagation();
 				this.openFile(node);
 			});
-		} else {
+		} else if (node.kind === "search") {
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_SEARCH;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
 			row.addEventListener("click", (e: MouseEvent) => {
 				e.stopPropagation();
 				void this.openSearch(node);
+			});
+		} else if (node.kind === "url") {
+			const icon = row.createSpan({ cls: "phb-item-icon" });
+			icon.innerHTML = ICON_LINK;
+			row.createDiv({ cls: "phb-item-title", text: node.title });
+			row.addEventListener("click", (e: MouseEvent) => {
+				e.stopPropagation();
+				this.openUrl(node);
+			});
+		} else {
+			const icon = row.createSpan({ cls: "phb-item-icon" });
+			icon.innerHTML = ICON_GRAPH;
+			row.createDiv({ cls: "phb-item-title", text: node.title });
+			row.addEventListener("click", (e: MouseEvent) => {
+				e.stopPropagation();
+				void this.openGraph(node);
 			});
 		}
 
@@ -393,9 +491,10 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	private rerenderList(): void {
 		if (!this.listEl) return;
 		const scrollTop = this.listEl.scrollTop;
-		this.renderInto(this.listEl);
-		this.listEl.scrollTop = scrollTop;
-		this.positionPopover();
+		void this.renderInto(this.listEl).then(() => {
+			if (this.listEl) this.listEl.scrollTop = scrollTop;
+			this.positionPopover();
+		});
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -420,6 +519,35 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			}
 		} catch (e) {
 			console.error("Page Header Bookmarks: failed to open search", e);
+		} finally {
+			this.closePopover();
+		}
+	}
+
+	private openUrl(node: TreeNode): void {
+		const url = node.url ?? "";
+		if (url) {
+			try {
+				window.open(url, "_blank");
+			} catch (e) {
+				console.error("Page Header Bookmarks: failed to open url", e);
+			}
+		}
+		this.closePopover();
+	}
+
+	private async openGraph(node: TreeNode): Promise<void> {
+		try {
+			const existing = this.app.workspace.getLeavesOfType("graph");
+			const leaf: WorkspaceLeaf | null = existing[0] ?? this.app.workspace.getRightLeaf(false);
+			if (leaf) {
+				const state: Record<string, unknown> = { query: "" };
+				if (node.options && typeof node.options === "object") Object.assign(state, node.options);
+				await leaf.setViewState({ type: "graph", state });
+				this.app.workspace.revealLeaf(leaf);
+			}
+		} catch (e) {
+			console.error("Page Header Bookmarks: failed to open graph", e);
 		} finally {
 			this.closePopover();
 		}

@@ -28,17 +28,18 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-var ICON_BOOKMARK = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/></svg>`;
 var ICON_FOLDER = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`;
 var ICON_FILE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>`;
 var ICON_SEARCH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>`;
+var ICON_LINK = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
+var ICON_GRAPH = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>`;
 var ICON_CHEVRON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`;
 var ICON_CLOSE = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`;
 var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
-    this.observer = null;
-    this.syncQueued = false;
+    /** Injected page-header buttons, keyed by the view they belong to. */
+    this.buttons = /* @__PURE__ */ new WeakMap();
     this.backdrop = null;
     this.popover = null;
     this.anchor = null;
@@ -53,53 +54,49 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     };
   }
   async onload() {
-    this.app.workspace.onLayoutReady(() => this.syncHeaders());
+    this.app.workspace.onLayoutReady(
+      () => window.setTimeout(() => this.addButtonsToAllLeaves(), 100)
+    );
     this.registerEvent(
       this.app.workspace.on("layout-change", () => {
-        this.syncHeaders();
+        this.addButtonsToAllLeaves();
         if (this.popover && this.anchor && !this.anchor.isConnected) this.closePopover();
       })
     );
-    this.observer = new MutationObserver(() => this.queueSync());
-    this.observer.observe(this.app.workspace.containerEl, { childList: true, subtree: true });
     this.register(() => {
-      var _a;
-      (_a = this.observer) == null ? void 0 : _a.disconnect();
       this.closePopover();
-      this.app.workspace.containerEl.querySelectorAll(".phb-button").forEach((btn) => btn.remove());
+      this.removeButtonsFromAllLeaves();
     });
   }
   /* ------------------------------------------------------------------ */
-  /* Page header button ("page header" as defined by the Commander      */
-  /* plugin: the title bar at the top of each pane, i.e. .view-header)  */
+  /* Page header button — same mechanism as the Commander plugin:        */
+  /* ItemView.addAction() (native icon rendering + native button shape), */
+  /* ordered left of the "more options" button via CSS `order`.          */
   /* ------------------------------------------------------------------ */
-  queueSync() {
-    if (this.syncQueued) return;
-    this.syncQueued = true;
-    requestAnimationFrame(() => {
-      this.syncQueued = false;
-      this.syncHeaders();
-    });
+  addButtonsToAllLeaves() {
+    window.requestAnimationFrame(
+      () => this.app.workspace.iterateAllLeaves((leaf) => this.addButtonToLeaf(leaf))
+    );
   }
-  syncHeaders() {
-    const root = this.app.workspace.containerEl;
-    root.querySelectorAll(".view-header").forEach((header) => {
-      if (header.querySelector(".phb-button")) return;
-      const btn = header.createEl("button", {
-        cls: "phb-button clickable-icon view-action",
-        attr: { "aria-label": "\u4E66\u7B7E" }
-      });
-      btn.innerHTML = ICON_BOOKMARK;
-      const right = header.querySelector(".view-header-right");
-      const actions = header.querySelector(".view-actions");
-      if (right && actions) right.insertBefore(btn, actions);
-      else if (right) right.appendChild(btn);
-      else header.appendChild(btn);
-      btn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.togglePopover(btn);
-      });
+  addButtonToLeaf(leaf) {
+    const view = leaf.view;
+    if (!(view instanceof import_obsidian.ItemView)) return;
+    if (this.buttons.has(view)) return;
+    const button = view.addAction("bookmark", "\u4E66\u7B7E", () => {
+      this.togglePopover(button);
+    });
+    button.addClass("phb-button");
+    this.buttons.set(view, button);
+  }
+  removeButtonsFromAllLeaves() {
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view;
+      if (!(view instanceof import_obsidian.ItemView)) return;
+      const button = this.buttons.get(view);
+      if (button) {
+        button.detach();
+        this.buttons.delete(view);
+      }
     });
   }
   /* ------------------------------------------------------------------ */
@@ -131,7 +128,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     });
     this.listEl = popover.createDiv({ cls: "phb-popover-list" });
     this.expanded.clear();
-    this.renderInto(this.listEl);
+    void this.renderInto(this.listEl).finally(() => this.positionPopover());
     backdrop.addEventListener("click", () => this.closePopover());
     window.addEventListener("keydown", this.keyHandler);
     window.addEventListener("resize", this.resizeHandler);
@@ -165,26 +162,82 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     popover.style.visibility = "visible";
   }
   /* ------------------------------------------------------------------ */
+  /* Data resolution                                                     */
+  /* ------------------------------------------------------------------ */
+  /**
+   * Fetch bookmark data from every source we know about, newest first:
+   *   1. live instances (`app.bookmarks`, `app.internalPlugins…instance`)
+   *      — items may be ungrouped (old shape) or a unified list that also
+   *      contains `type: "group"` entries with nested items (new shape);
+   *   2. `getBookmarks()` flat list when the instance exposes it;
+   *   3. the core plugin's data file `.obsidian/bookmarks.json` (most
+   *      reliable across versions; read on demand so it is always fresh).
+   */
+  async resolveBookmarks() {
+    var _a, _b, _c;
+    const liveSources = [];
+    try {
+      liveSources.push(this.app.bookmarks);
+    } catch (e) {
+    }
+    try {
+      liveSources.push(
+        (_c = (_b = (_a = this.app.internalPlugins) == null ? void 0 : _a.plugins) == null ? void 0 : _b.bookmarks) == null ? void 0 : _c.instance
+      );
+    } catch (e) {
+    }
+    for (const source of liveSources) {
+      if (!source) continue;
+      try {
+        const s = source;
+        if (typeof s.getBookmarks === "function") {
+          const flat = s.getBookmarks();
+          if (Array.isArray(flat) && flat.length > 0) return { items: flat, groups: [] };
+        }
+        const items = Array.isArray(s.items) ? s.items : [];
+        const groups = Array.isArray(s.groups) ? s.groups : [];
+        if (items.length > 0 || groups.length > 0) return { items, groups };
+      } catch (e) {
+      }
+    }
+    try {
+      const adapter = this.app.vault.adapter;
+      if (adapter && typeof adapter.read === "function") {
+        const raw = await adapter.read(".obsidian/bookmarks.json");
+        if (raw) {
+          const data = JSON.parse(raw);
+          return {
+            items: Array.isArray(data == null ? void 0 : data.items) ? data.items : [],
+            groups: Array.isArray(data == null ? void 0 : data.groups) ? data.groups : []
+          };
+        }
+      }
+    } catch (e) {
+    }
+    return null;
+  }
+  /* ------------------------------------------------------------------ */
   /* Rendering                                                           */
   /* ------------------------------------------------------------------ */
-  renderInto(list) {
-    var _a, _b;
+  async renderInto(list) {
     list.empty();
-    const bookmarksInternal = (_b = (_a = this.app.internalPlugins) == null ? void 0 : _a.plugins) == null ? void 0 : _b.bookmarks;
-    if (!(bookmarksInternal == null ? void 0 : bookmarksInternal.enabled)) {
-      list.createDiv({ cls: "phb-empty", text: "\u6838\u5FC3\u63D2\u4EF6\u300C\u4E66\u7B7E\u300D\u672A\u542F\u7528" });
+    const data = await this.resolveBookmarks();
+    if (!data) {
+      list.createDiv({
+        cls: "phb-empty",
+        text: "\u672A\u8BFB\u53D6\u5230\u4E66\u7B7E\u6570\u636E\uFF08\u8BF7\u786E\u8BA4\u6838\u5FC3\u63D2\u4EF6\u300C\u4E66\u7B7E\u300D\u5DF2\u542F\u7528\uFF09"
+      });
       const enableBtn = list.createEl("button", { cls: "phb-enable", text: "\u542F\u7528\u4E66\u7B7E\u63D2\u4EF6" });
       enableBtn.addEventListener("click", () => {
-        var _a2;
-        void ((_a2 = bookmarksInternal == null ? void 0 : bookmarksInternal.enable) == null ? void 0 : _a2.call(bookmarksInternal));
+        var _a, _b, _c, _d;
+        void ((_d = (_c = (_b = (_a = this.app.internalPlugins) == null ? void 0 : _a.plugins) == null ? void 0 : _b.bookmarks) == null ? void 0 : _c.enable) == null ? void 0 : _d.call(_c));
         window.setTimeout(() => {
-          this.renderInto(list);
-          this.positionPopover();
-        }, 150);
+          void this.renderInto(list).then(() => this.positionPopover());
+        }, 200);
       });
       return;
     }
-    const nodes = this.buildTree();
+    const nodes = this.buildTree(data);
     if (nodes.length === 0) {
       list.createDiv({
         cls: "phb-empty",
@@ -194,14 +247,10 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     }
     this.renderNodes(list, nodes);
   }
-  buildTree() {
+  buildTree(data) {
     var _a;
-    const bm = this.app.bookmarks;
     const root = [];
-    if (!bm) return root;
-    const items = Array.isArray(bm.items) ? bm.items : [];
-    const groups = Array.isArray(bm.groups) ? bm.groups : [];
-    for (const it of items) {
+    for (const it of data.items) {
       if ((it == null ? void 0 : it.type) === "group" && Array.isArray(it.items) && it.items.length > 0) {
         const kids = it.items.map((x) => this.itemToNode(x)).filter((n) => n !== null);
         if (kids.length > 0) root.push({ kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
@@ -210,14 +259,14 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
         if (n) root.push(n);
       }
     }
-    for (const g of groups) {
+    for (const g of data.groups) {
       const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map((x) => this.itemToNode(x)).filter((n) => n !== null);
       if (kids.length > 0) root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
     }
     return root;
   }
   itemToNode(it) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g;
     if (!it) return null;
     const type = it.type;
     if (type === "file") {
@@ -233,11 +282,17 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       const query = (_e = (_d = it.query) != null ? _d : it.path) != null ? _e : "";
       return { kind: "search", title: it.title || query || "\u641C\u7D22", query, path: (_f = it.path) != null ? _f : "" };
     }
+    if (type === "url") {
+      return { kind: "url", title: it.title || it.url || "\u94FE\u63A5", url: (_g = it.url) != null ? _g : "" };
+    }
+    if (type === "graph") {
+      return { kind: "graph", title: it.title || "\u56FE\u8C31", options: it.options };
+    }
     return null;
   }
   /** Stable identity for a tree node, used to keep expansion state across re-renders. */
   nodeKey(node) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     switch (node.kind) {
       case "file":
         return `file:${(_a = node.path) != null ? _a : ""}`;
@@ -245,8 +300,12 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
         return `folder:${(_b = node.path) != null ? _b : ""}`;
       case "search":
         return `search:${(_e = (_d = (_c = node.query) != null ? _c : node.path) != null ? _d : node.title) != null ? _e : ""}`;
+      case "url":
+        return `url:${(_g = (_f = node.url) != null ? _f : node.title) != null ? _g : ""}`;
+      case "graph":
+        return `graph:${(_h = node.title) != null ? _h : ""}`;
       case "group":
-        return `group:${(_f = node.id) != null ? _f : node.title}`;
+        return `group:${(_i = node.id) != null ? _i : node.title}`;
       default:
         return "";
     }
@@ -282,13 +341,29 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
         e.stopPropagation();
         this.openFile(node);
       });
-    } else {
+    } else if (node.kind === "search") {
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_SEARCH;
       row.createDiv({ cls: "phb-item-title", text: node.title });
       row.addEventListener("click", (e) => {
         e.stopPropagation();
         void this.openSearch(node);
+      });
+    } else if (node.kind === "url") {
+      const icon = row.createSpan({ cls: "phb-item-icon" });
+      icon.innerHTML = ICON_LINK;
+      row.createDiv({ cls: "phb-item-title", text: node.title });
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.openUrl(node);
+      });
+    } else {
+      const icon = row.createSpan({ cls: "phb-item-icon" });
+      icon.innerHTML = ICON_GRAPH;
+      row.createDiv({ cls: "phb-item-title", text: node.title });
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void this.openGraph(node);
       });
     }
     return wrap;
@@ -330,9 +405,10 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   rerenderList() {
     if (!this.listEl) return;
     const scrollTop = this.listEl.scrollTop;
-    this.renderInto(this.listEl);
-    this.listEl.scrollTop = scrollTop;
-    this.positionPopover();
+    void this.renderInto(this.listEl).then(() => {
+      if (this.listEl) this.listEl.scrollTop = scrollTop;
+      this.positionPopover();
+    });
   }
   /* ------------------------------------------------------------------ */
   /* Actions                                                             */
@@ -356,6 +432,35 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       }
     } catch (e) {
       console.error("Page Header Bookmarks: failed to open search", e);
+    } finally {
+      this.closePopover();
+    }
+  }
+  openUrl(node) {
+    var _a;
+    const url = (_a = node.url) != null ? _a : "";
+    if (url) {
+      try {
+        window.open(url, "_blank");
+      } catch (e) {
+        console.error("Page Header Bookmarks: failed to open url", e);
+      }
+    }
+    this.closePopover();
+  }
+  async openGraph(node) {
+    var _a;
+    try {
+      const existing = this.app.workspace.getLeavesOfType("graph");
+      const leaf = (_a = existing[0]) != null ? _a : this.app.workspace.getRightLeaf(false);
+      if (leaf) {
+        const state = { query: "" };
+        if (node.options && typeof node.options === "object") Object.assign(state, node.options);
+        await leaf.setViewState({ type: "graph", state });
+        this.app.workspace.revealLeaf(leaf);
+      }
+    } catch (e) {
+      console.error("Page Header Bookmarks: failed to open graph", e);
     } finally {
       this.closePopover();
     }
