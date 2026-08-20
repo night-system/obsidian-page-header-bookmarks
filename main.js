@@ -66,6 +66,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       var _a;
       (_a = this.observer) == null ? void 0 : _a.disconnect();
       this.closePopover();
+      this.app.workspace.containerEl.querySelectorAll(".phb-button").forEach((btn) => btn.remove());
     });
   }
   /* ------------------------------------------------------------------ */
@@ -211,12 +212,12 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     }
     for (const g of groups) {
       const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map((x) => this.itemToNode(x)).filter((n) => n !== null);
-      if (kids.length > 0) root.push({ kind: "group", title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
+      if (kids.length > 0) root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
     }
     return root;
   }
   itemToNode(it) {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e, _f;
     if (!it) return null;
     const type = it.type;
     if (type === "file") {
@@ -229,9 +230,26 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       return { kind: "folder", title: it.title || ((_b = it.path) != null ? _b : "").split("/").pop() || "", path: (_c = it.path) != null ? _c : "" };
     }
     if (type === "search") {
-      return { kind: "search", title: it.title || it.path || "\u641C\u7D22", path: (_d = it.path) != null ? _d : "" };
+      const query = (_e = (_d = it.query) != null ? _d : it.path) != null ? _e : "";
+      return { kind: "search", title: it.title || query || "\u641C\u7D22", query, path: (_f = it.path) != null ? _f : "" };
     }
     return null;
+  }
+  /** Stable identity for a tree node, used to keep expansion state across re-renders. */
+  nodeKey(node) {
+    var _a, _b, _c, _d, _e, _f;
+    switch (node.kind) {
+      case "file":
+        return `file:${(_a = node.path) != null ? _a : ""}`;
+      case "folder":
+        return `folder:${(_b = node.path) != null ? _b : ""}`;
+      case "search":
+        return `search:${(_e = (_d = (_c = node.query) != null ? _c : node.path) != null ? _d : node.title) != null ? _e : ""}`;
+      case "group":
+        return `group:${(_f = node.id) != null ? _f : node.title}`;
+      default:
+        return "";
+    }
   }
   renderNodes(container, nodes) {
     for (const node of nodes) container.appendChild(this.renderNode(node));
@@ -240,7 +258,7 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     const wrap = createDiv({ cls: "phb-node" });
     const row = wrap.createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
     if (node.kind === "group" || node.kind === "folder") {
-      const isOpen = this.expanded.has(node);
+      const isOpen = this.expanded.has(this.nodeKey(node));
       const caret = row.createSpan({ cls: ["phb-caret", ...isOpen ? ["phb-open"] : []] });
       caret.innerHTML = ICON_CHEVRON;
       const icon = row.createSpan({ cls: "phb-item-icon" });
@@ -304,8 +322,9 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     return [];
   }
   toggleNode(node) {
-    if (this.expanded.has(node)) this.expanded.delete(node);
-    else this.expanded.add(node);
+    const key = this.nodeKey(node);
+    if (this.expanded.has(key)) this.expanded.delete(key);
+    else this.expanded.add(key);
     this.rerenderList();
   }
   rerenderList() {
@@ -326,11 +345,11 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
     this.closePopover();
   }
   async openSearch(node) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     try {
-      const query = (_b = (_a = node.path) != null ? _a : node.title) != null ? _b : "";
+      const query = (_c = (_b = (_a = node.query) != null ? _a : node.path) != null ? _b : node.title) != null ? _c : "";
       const existing = this.app.workspace.getLeavesOfType("search");
-      const leaf = (_c = existing[0]) != null ? _c : this.app.workspace.getRightLeaf(false);
+      const leaf = (_d = existing[0]) != null ? _d : this.app.workspace.getRightLeaf(false);
       if (leaf) {
         await leaf.setViewState({ type: "search", state: { query } });
         this.app.workspace.revealLeaf(leaf);

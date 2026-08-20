@@ -9,6 +9,8 @@ interface BookmarkItem {
 	title?: string;
 	path?: string;
 	subpath?: string;
+	/** Search bookmarks store their query in this field (core plugin schema). */
+	query?: string;
 	items?: BookmarkItem[];
 }
 
@@ -45,6 +47,10 @@ interface TreeNode {
 	title: string;
 	path?: string;
 	subpath?: string;
+	/** Search bookmarks: the search query. */
+	query?: string;
+	/** Groups: stable id when the core plugin provides one. */
+	id?: string;
 	/** The underlying file no longer exists. */
 	missing?: boolean;
 	/** Lazily loaded / prebuilt children (groups and folders). */
@@ -59,7 +65,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	private popover: HTMLElement | null = null;
 	private anchor: HTMLElement | null = null;
 	private listEl: HTMLElement | null = null;
-	private expanded = new Set<TreeNode>();
+	private expanded = new Set<string>();
 
 	private keyHandler = (e: KeyboardEvent): void => {
 		if (e.key === "Escape") this.closePopover();
@@ -87,6 +93,10 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		this.register(() => {
 			this.observer?.disconnect();
 			this.closePopover();
+			// Remove injected page-header buttons so a disabled plugin leaves no residue.
+			this.app.workspace.containerEl
+				.querySelectorAll<HTMLElement>(".phb-button")
+				.forEach((btn) => btn.remove());
 		});
 	}
 
@@ -259,7 +269,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			const kids = (g?.items ?? [])
 				.map((x) => this.itemToNode(x))
 				.filter((n): n is TreeNode => n !== null);
-			if (kids.length > 0) root.push({ kind: "group", title: g?.title || "未命名分组", children: kids });
+			if (kids.length > 0) root.push({ kind: "group", id: g?.id, title: g?.title || "未命名分组", children: kids });
 		}
 		return root;
 	}
@@ -277,9 +287,26 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			return { kind: "folder", title: it.title || (it.path ?? "").split("/").pop() || "", path: it.path ?? "" };
 		}
 		if (type === "search") {
-			return { kind: "search", title: it.title || it.path || "搜索", path: it.path ?? "" };
+			const query = it.query ?? it.path ?? "";
+			return { kind: "search", title: it.title || query || "搜索", query, path: it.path ?? "" };
 		}
 		return null;
+	}
+
+	/** Stable identity for a tree node, used to keep expansion state across re-renders. */
+	private nodeKey(node: TreeNode): string {
+		switch (node.kind) {
+			case "file":
+				return `file:${node.path ?? ""}`;
+			case "folder":
+				return `folder:${node.path ?? ""}`;
+			case "search":
+				return `search:${node.query ?? node.path ?? node.title ?? ""}`;
+			case "group":
+				return `group:${node.id ?? node.title}`;
+			default:
+				return "";
+		}
 	}
 
 	private renderNodes(container: HTMLElement, nodes: TreeNode[]): void {
@@ -291,7 +318,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		const row = wrap.createDiv({ cls: ["phb-item", `phb-item-${node.kind}`] });
 
 		if (node.kind === "group" || node.kind === "folder") {
-			const isOpen = this.expanded.has(node);
+			const isOpen = this.expanded.has(this.nodeKey(node));
 			const caret = row.createSpan({ cls: ["phb-caret", ...(isOpen ? ["phb-open"] : [])] });
 			caret.innerHTML = ICON_CHEVRON;
 			const icon = row.createSpan({ cls: "phb-item-icon" });
@@ -357,8 +384,9 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	}
 
 	private toggleNode(node: TreeNode): void {
-		if (this.expanded.has(node)) this.expanded.delete(node);
-		else this.expanded.add(node);
+		const key = this.nodeKey(node);
+		if (this.expanded.has(key)) this.expanded.delete(key);
+		else this.expanded.add(key);
 		this.rerenderList();
 	}
 
@@ -383,7 +411,7 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 
 	private async openSearch(node: TreeNode): Promise<void> {
 		try {
-			const query = node.path ?? node.title ?? "";
+			const query = node.query ?? node.path ?? node.title ?? "";
 			const existing = this.app.workspace.getLeavesOfType("search");
 			const leaf: WorkspaceLeaf | null = existing[0] ?? this.app.workspace.getRightLeaf(false);
 			if (leaf) {
