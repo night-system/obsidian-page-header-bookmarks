@@ -130,10 +130,6 @@
 	text-overflow: ellipsis;
 }
 
-.phb-item-missing {
-	opacity: 0.5;
-}
-
 .phb-children {
 	margin-left: 10px;
 	padding-left: 6px;

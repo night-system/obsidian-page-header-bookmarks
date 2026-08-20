@@ -58,8 +58,6 @@ interface TreeNode {
 	url?: string;
 	options?: unknown;
 	id?: string;
-	/** The underlying file no longer exists. */
-	missing?: boolean;
 	/** Lazily loaded / prebuilt children (groups and folders). */
 	children?: TreeNode[];
 }
@@ -324,26 +322,70 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	}
 
 	private buildTree(data: BookmarksData): TreeNode[] {
-		const root: TreeNode[] = [];
+		// Items whose target no longer exists are hidden (same as the core
+		// bookmarks view), and file/folder bookmarks inside a bookmarked
+		// folder are only shown via that folder's expansion (dedup).
+		const covered = this.computeCoveredPaths(data);
 
+		const convert = (it: BookmarkItem | undefined): TreeNode | null => {
+			if (!it) return null;
+			if ((it.type === "file" || it.type === "folder") && it.path && covered.has(it.path)) {
+				return null;
+			}
+			return this.itemToNode(it);
+		};
+
+		const root: TreeNode[] = [];
 		for (const it of data.items) {
 			if (it?.type === "group") {
 				const kids = (Array.isArray(it.items) ? it.items : [])
-					.map((x) => this.itemToNode(x))
+					.map(convert)
 					.filter((n): n is TreeNode => n !== null);
 				root.push({ kind: "group", title: it.title || "未命名分组", children: kids });
 			} else {
-				const n = this.itemToNode(it);
+				const n = convert(it);
 				if (n) root.push(n);
 			}
 		}
 		for (const g of data.groups) {
 			const kids = (g?.items ?? [])
-				.map((x) => this.itemToNode(x))
+				.map(convert)
 				.filter((n): n is TreeNode => n !== null);
 			root.push({ kind: "group", id: g?.id, title: g?.title || "未命名分组", children: kids });
 		}
 		return root;
+	}
+
+	/**
+	 * Paths that should not appear as standalone bookmarks: every file and
+	 * folder inside any bookmarked folder (they are reachable by expanding
+	 * the folder bookmark instead).
+	 */
+	private computeCoveredPaths(data: BookmarksData): Set<string> {
+		const folderPaths = new Set<string>();
+		const collect = (it: BookmarkItem | undefined): void => {
+			if (!it) return;
+			if (it.type === "folder" && it.path) folderPaths.add(it.path);
+			(it.items ?? []).forEach(collect);
+		};
+		data.items.forEach(collect);
+		for (const g of data.groups) (g?.items ?? []).forEach(collect);
+
+		const covered = new Set<string>();
+		const visit = (path: string): void => {
+			const folder = this.app.vault.getAbstractFileByPath(path);
+			if (!(folder instanceof TFolder)) return;
+			for (const child of folder.children) {
+				if (child instanceof TFile) {
+					covered.add(child.path);
+				} else if (child instanceof TFolder) {
+					covered.add(child.path);
+					visit(child.path);
+				}
+			}
+		};
+		for (const p of folderPaths) visit(p);
+		return covered;
 	}
 
 	private itemToNode(it: BookmarkItem | undefined): TreeNode | null {
@@ -352,11 +394,17 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 		if (type === "file") {
 			const path = it.path ?? "";
 			const file = this.app.vault.getAbstractFileByPath(path);
-			const missing = !(file instanceof TFile);
-			return { kind: "file", title: it.title || path.replace(/\.md$/, ""), path, subpath: it.subpath, missing };
+			// Deleted files are hidden, same as the core bookmarks view.
+			if (!(file instanceof TFile)) return null;
+			const title = it.title && it.title.trim() ? it.title : file.basename;
+			return { kind: "file", title, path, subpath: it.subpath };
 		}
 		if (type === "folder") {
-			return { kind: "folder", title: it.title || (it.path ?? "").split("/").pop() || "", path: it.path ?? "" };
+			const path = it.path ?? "";
+			const folder = this.app.vault.getAbstractFileByPath(path);
+			if (!(folder instanceof TFolder)) return null;
+			const title = it.title && it.title.trim() ? it.title : folder.name;
+			return { kind: "folder", title, path };
 		}
 		if (type === "search") {
 			const query = it.query ?? it.path ?? "";
@@ -421,7 +469,6 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 			const icon = row.createSpan({ cls: "phb-item-icon" });
 			icon.innerHTML = ICON_FILE;
 			row.createDiv({ cls: "phb-item-title", text: node.title });
-			if (node.missing) row.addClass("phb-item-missing");
 			row.addEventListener("click", (e: MouseEvent) => {
 				e.stopPropagation();
 				this.openFile(node);
@@ -506,8 +553,9 @@ export default class PageHeaderBookmarksPlugin extends Plugin {
 	/* ------------------------------------------------------------------ */
 
 	private openFile(node: TreeNode): void {
-		if (node.missing) {
-			// Nothing to open, but still honour "any click on a file row closes".
+		const file = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
+		if (!(file instanceof TFile)) {
+			// Deleted between render and click — still close per the close rule.
 			this.closePopover();
 			return;
 		}

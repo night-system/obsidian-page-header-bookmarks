@@ -249,41 +249,86 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   }
   buildTree(data) {
     var _a;
+    const covered = this.computeCoveredPaths(data);
+    const convert = (it) => {
+      if (!it) return null;
+      if ((it.type === "file" || it.type === "folder") && it.path && covered.has(it.path)) {
+        return null;
+      }
+      return this.itemToNode(it);
+    };
     const root = [];
     for (const it of data.items) {
       if ((it == null ? void 0 : it.type) === "group") {
-        const kids = (Array.isArray(it.items) ? it.items : []).map((x) => this.itemToNode(x)).filter((n) => n !== null);
+        const kids = (Array.isArray(it.items) ? it.items : []).map(convert).filter((n) => n !== null);
         root.push({ kind: "group", title: it.title || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
       } else {
-        const n = this.itemToNode(it);
+        const n = convert(it);
         if (n) root.push(n);
       }
     }
     for (const g of data.groups) {
-      const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map((x) => this.itemToNode(x)).filter((n) => n !== null);
+      const kids = ((_a = g == null ? void 0 : g.items) != null ? _a : []).map(convert).filter((n) => n !== null);
       root.push({ kind: "group", id: g == null ? void 0 : g.id, title: (g == null ? void 0 : g.title) || "\u672A\u547D\u540D\u5206\u7EC4", children: kids });
     }
     return root;
   }
+  /**
+   * Paths that should not appear as standalone bookmarks: every file and
+   * folder inside any bookmarked folder (they are reachable by expanding
+   * the folder bookmark instead).
+   */
+  computeCoveredPaths(data) {
+    var _a;
+    const folderPaths = /* @__PURE__ */ new Set();
+    const collect = (it) => {
+      var _a2;
+      if (!it) return;
+      if (it.type === "folder" && it.path) folderPaths.add(it.path);
+      ((_a2 = it.items) != null ? _a2 : []).forEach(collect);
+    };
+    data.items.forEach(collect);
+    for (const g of data.groups) ((_a = g == null ? void 0 : g.items) != null ? _a : []).forEach(collect);
+    const covered = /* @__PURE__ */ new Set();
+    const visit = (path) => {
+      const folder = this.app.vault.getAbstractFileByPath(path);
+      if (!(folder instanceof import_obsidian.TFolder)) return;
+      for (const child of folder.children) {
+        if (child instanceof import_obsidian.TFile) {
+          covered.add(child.path);
+        } else if (child instanceof import_obsidian.TFolder) {
+          covered.add(child.path);
+          visit(child.path);
+        }
+      }
+    };
+    for (const p of folderPaths) visit(p);
+    return covered;
+  }
   itemToNode(it) {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f;
     if (!it) return null;
     const type = it.type;
     if (type === "file") {
       const path = (_a = it.path) != null ? _a : "";
       const file = this.app.vault.getAbstractFileByPath(path);
-      const missing = !(file instanceof import_obsidian.TFile);
-      return { kind: "file", title: it.title || path.replace(/\.md$/, ""), path, subpath: it.subpath, missing };
+      if (!(file instanceof import_obsidian.TFile)) return null;
+      const title = it.title && it.title.trim() ? it.title : file.basename;
+      return { kind: "file", title, path, subpath: it.subpath };
     }
     if (type === "folder") {
-      return { kind: "folder", title: it.title || ((_b = it.path) != null ? _b : "").split("/").pop() || "", path: (_c = it.path) != null ? _c : "" };
+      const path = (_b = it.path) != null ? _b : "";
+      const folder = this.app.vault.getAbstractFileByPath(path);
+      if (!(folder instanceof import_obsidian.TFolder)) return null;
+      const title = it.title && it.title.trim() ? it.title : folder.name;
+      return { kind: "folder", title, path };
     }
     if (type === "search") {
-      const query = (_e = (_d = it.query) != null ? _d : it.path) != null ? _e : "";
-      return { kind: "search", title: it.title || query || "\u641C\u7D22", query, path: (_f = it.path) != null ? _f : "" };
+      const query = (_d = (_c = it.query) != null ? _c : it.path) != null ? _d : "";
+      return { kind: "search", title: it.title || query || "\u641C\u7D22", query, path: (_e = it.path) != null ? _e : "" };
     }
     if (type === "url") {
-      return { kind: "url", title: it.title || it.url || "\u94FE\u63A5", url: (_g = it.url) != null ? _g : "" };
+      return { kind: "url", title: it.title || it.url || "\u94FE\u63A5", url: (_f = it.url) != null ? _f : "" };
     }
     if (type === "graph") {
       return { kind: "graph", title: it.title || "\u56FE\u8C31", options: it.options };
@@ -339,7 +384,6 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
       const icon = row.createSpan({ cls: "phb-item-icon" });
       icon.innerHTML = ICON_FILE;
       row.createDiv({ cls: "phb-item-title", text: node.title });
-      if (node.missing) row.addClass("phb-item-missing");
       row.addEventListener("click", (e) => {
         e.stopPropagation();
         this.openFile(node);
@@ -420,7 +464,8 @@ var PageHeaderBookmarksPlugin = class extends import_obsidian.Plugin {
   /* ------------------------------------------------------------------ */
   openFile(node) {
     var _a;
-    if (node.missing) {
+    const file = node.path ? this.app.vault.getAbstractFileByPath(node.path) : null;
+    if (!(file instanceof import_obsidian.TFile)) {
       this.closePopover();
       return;
     }
